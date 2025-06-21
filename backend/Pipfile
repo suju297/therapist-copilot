@@ -1,0 +1,40 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+fastapi = "*"
+uvicorn = {extras = ["standard"], version = "*"}
+python-multipart = "*"
+websockets = "*"
+python-dotenv = "*"
+pydantic = "*"
+langchain = "*"
+langchain-google-genai = "*"
+openai-whisper = "*"
+deepgram-sdk = ">=3.2.0"
+websocket-client = "*"
+torch = "*"
+torchaudio = "*"
+numpy = "*"
+soundfile = "*"
+aiofiles = "*"
+pydantic-settings = "*"
+
+[dev-packages]
+pytest = "*"
+pytest-asyncio = "*"
+pytest-cov = "*"
+black = "*"
+flake8 = "*"
+
+[requires]
+python_version = "3.11"
+
+[scripts]
+# Convenience scripts
+start = "uvicorn main:app --reload --host 0.0.0.0 --port 8000"
+test = "pytest -v"
+format = "black ."
+dev = "uvicorn main:app --reload --host 0.0.0.0 --port 8000 --log-level debug"
