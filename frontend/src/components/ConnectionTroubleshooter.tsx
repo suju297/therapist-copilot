@@ -1,4 +1,4 @@
-// src/components/ConnectionTroubleshooter.tsx - Updated for proper WebSocket flow
+// src/components/ConnectionTroubleshooter.tsx - Safe Version (Compatible with current useWebSocket)
 import React, { useState } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { 
@@ -13,7 +13,8 @@ import {
   Mic,
   MicOff,
   Play,
-  Square
+  Square,
+  Shield
 } from 'lucide-react';
 
 export default function ConnectionTroubleshooter() {
@@ -30,6 +31,9 @@ export default function ConnectionTroubleshooter() {
     });
   });
 
+  // Get properties from useWebSocket hook (safely handle missing enhanced properties)
+  const webSocketData = useWebSocket(sessionId);
+  
   const { 
     messages, 
     isConnected, 
@@ -37,15 +41,94 @@ export default function ConnectionTroubleshooter() {
     isRecording, 
     connectionError,
     audioConfig,
-    lastPartial, // New: live transcription text
+    lastPartial, // Live transcription text
     startRecording, 
     stopRecording,
     disconnect,
     reconnect,
-    forceReconnect,
     resetSession,
     clearMessages
-  } = useWebSocket(sessionId);
+  } = webSocketData;
+
+  // Safely extract enhanced mental health monitoring properties (if available)
+  const currentRisk = (webSocketData as any).currentRisk || {
+    score: 0,
+    level: "low",
+    mentalState: "calm",
+    emotions: [],
+    explanation: "",
+    recommendations: [],
+    lastUpdated: "",
+  };
+  
+  const isCrisisMode = (webSocketData as any).isCrisisMode || false;
+  const isSessionLocked = (webSocketData as any).isSessionLocked || false;
+  const finalTranscripts = (webSocketData as any).finalTranscripts || [];
+  const forceReconnect = (webSocketData as any).forceReconnect || reconnect;
+
+  const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null);
+  const [healthCheckLoading, setHealthCheckLoading] = useState(false);
+  const [wsStats, setWsStats] = useState<any>(null);
+
+  const checkBackendHealth = async () => {
+    setHealthCheckLoading(true);
+    try {
+      // Check WebSocket stats from the correct endpoint
+      const response = await fetch('http://localhost:8000/api/v1/ws/stats', {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' }
+      });
+      
+      if (response.ok) {
+        const stats = await response.json();
+        setWsStats(stats);
+        setIsBackendHealthy(true);
+        console.log("📊 WebSocket Stats:", stats);
+      } else {
+        setIsBackendHealthy(false);
+      }
+    } catch (error) {
+      console.error('Health check failed:', error);
+      setIsBackendHealthy(false);
+    } finally {
+      setHealthCheckLoading(false);
+    }
+  };
+
+  // Helper functions for enhanced mental health monitoring
+  const getMentalStateEmoji = (state: string) => {
+    switch (state) {
+      case 'calm': return '😌';
+      case 'stressed': return '😰';
+      case 'anxious': return '😟';
+      case 'depressed': return '😞';
+      case 'suicidal': return '🚨';
+      default: return '😐';
+    }
+  };
+
+  const getMentalStateColor = (state: string) => {
+    switch (state) {
+      case 'calm': return 'text-green-600 bg-green-100 border-green-300';
+      case 'stressed': return 'text-yellow-600 bg-yellow-100 border-yellow-300';
+      case 'anxious': return 'text-orange-600 bg-orange-100 border-orange-300';
+      case 'depressed': return 'text-red-600 bg-red-100 border-red-300';
+      case 'suicidal': return 'text-red-800 bg-red-200 border-red-400 animate-pulse';
+      default: return 'text-gray-600 bg-gray-100 border-gray-300';
+    }
+  };
+
+  const getRiskLevelColor = (level: string) => {
+    switch (level) {
+      case 'low': return 'bg-green-500';
+      case 'medium': return 'bg-yellow-500';
+      case 'high': return 'bg-orange-500';
+      case 'critical': return 'bg-red-500 animate-pulse';
+      default: return 'bg-gray-500';
+    }
+  };
+
+  const getRiskPercentage = () => Math.round((currentRisk?.score || 0) * 100);
 
   // Helper functions
   const getConnectionIcon = () => {
@@ -205,71 +288,130 @@ export default function ConnectionTroubleshooter() {
         </div>
       )}
 
-      {/* Controls */}
-      <div className="bg-white border rounded-lg p-4">
-        <h3 className="font-semibold mb-4">Controls</h3>
-        <div className="flex flex-wrap gap-3">
-          {/* Recording Controls */}
-          <button
-            onClick={canStartRecording ? startRecording : undefined}
-            disabled={!canStartRecording}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-              canStartRecording
-                ? 'bg-red-600 text-white hover:bg-red-700'
-                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-            }`}
-          >
-            <Play className="h-4 w-4" />
-            Start Recording
-          </button>
-
-          <button
-            onClick={stopRecording}
-            disabled={!isRecording}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-              isRecording
-                ? 'bg-gray-700 text-white hover:bg-gray-800'
-                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
-            }`}
-          >
-            <Square className="h-4 w-4" />
-            Stop Recording
-          </button>
-
-          {/* Connection Controls */}
-          <button
-            onClick={reconnect}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
-          >
-            <RefreshCw className="h-4 w-4" />
-            Reconnect
-          </button>
-
-          <button
-            onClick={disconnect}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg font-medium hover:bg-gray-700"
-          >
-            <WifiOff className="h-4 w-4" />
-            Disconnect
-          </button>
-
-          {/* Utility Controls */}
-          <button
-            onClick={resetSession}
-            className="flex items-center gap-2 px-4 py-2 bg-yellow-600 text-white rounded-lg font-medium hover:bg-yellow-700"
-          >
-            <RefreshCw className="h-4 w-4" />
-            Reset Session
-          </button>
-
-          <button
-            onClick={clearMessages}
-            className="px-4 py-2 bg-gray-500 text-white rounded-lg font-medium hover:bg-gray-600"
-          >
-            Clear Messages
-          </button>
+      {/* Enhanced Mental Health Monitoring Dashboard - Only show if enhanced features available */}
+      {(isRecording || (currentRisk?.score || 0) > 0) && (currentRisk?.score > 0 || currentRisk?.explanation) && (
+        <div className="bg-white border rounded-lg p-6">
+          <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Mental Health Monitoring Dashboard
+          </h2>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Mental State & Risk Level */}
+            <div className="space-y-4">
+              <div>
+                <label className="text-sm font-medium text-gray-600">Mental State</label>
+                <div className={`flex items-center gap-2 p-3 rounded-lg border ${getMentalStateColor(currentRisk?.mentalState || 'calm')}`}>
+                  <span className="text-2xl">{getMentalStateEmoji(currentRisk?.mentalState || 'calm')}</span>
+                  <span className="font-medium capitalize">{currentRisk?.mentalState || 'calm'}</span>
+                </div>
+              </div>
+              
+              <div>
+                <label className="text-sm font-medium text-gray-600">Risk Level</label>
+                <div className="mt-1">
+                  <div className="flex items-center justify-between text-sm mb-1">
+                    <span className="capitalize font-medium">{currentRisk?.level || 'low'}</span>
+                    <span>{getRiskPercentage()}%</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-3">
+                    <div 
+                      className={`h-3 rounded-full transition-all duration-500 ${getRiskLevelColor(currentRisk?.level || 'low')}`}
+                      style={{ width: `${getRiskPercentage()}%` }}
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            {/* Emotions & Analysis Context */}
+            <div className="space-y-4">
+              {(currentRisk?.emotions || []).length > 0 && (
+                <div>
+                  <label className="text-sm font-medium text-gray-600">Detected Emotions</label>
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {(currentRisk?.emotions || []).map((emotion, idx) => (
+                      <span 
+                        key={idx}
+                        className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-full border"
+                      >
+                        {emotion}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              {currentRisk?.windowContext && (
+                <div>
+                  <label className="text-sm font-medium text-gray-600">Analysis Context</label>
+                  <div className="text-xs text-gray-600 mt-1 space-y-1">
+                    <div>📊 {currentRisk.windowContext.wordsAnalyzed} words analyzed</div>
+                    <div>📝 {currentRisk.windowContext.transcriptCount} transcripts</div>
+                    <div>⏱️ {currentRisk.windowContext.windowSeconds}s window</div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+          
+          {/* Risk Explanation */}
+          {currentRisk?.explanation && (
+            <div className="mt-4 p-3 bg-gray-50 rounded-lg">
+              <div className="text-sm font-medium text-gray-700 mb-1">Analysis</div>
+              <div className="text-sm text-gray-600">{currentRisk.explanation}</div>
+            </div>
+          )}
+          
+          {/* Recommendations */}
+          {(currentRisk?.recommendations || []).length > 0 && (
+            <div className="mt-4">
+              <div className="text-sm font-medium text-gray-700 mb-2">Recommendations</div>
+              <ul className="space-y-1">
+                {(currentRisk?.recommendations || []).map((rec, idx) => (
+                  <li key={idx} className="flex items-start gap-2 text-sm text-gray-600">
+                    <span className="text-blue-500 mt-1">•</span>
+                    <span>{rec}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          
+          {/* Last Updated */}
+          {currentRisk?.lastUpdated && (
+            <div className="mt-4 text-xs text-gray-500">
+              Last updated: {new Date(currentRisk.lastUpdated).toLocaleTimeString()}
+            </div>
+          )}
         </div>
-      </div>
+      )}
+
+      {/* Crisis Mode Alert */}
+      {isCrisisMode && (
+        <div className="bg-red-100 border-2 border-red-400 rounded-lg p-4 animate-pulse">
+          <div className="flex items-center gap-2 text-red-800 mb-2">
+            <AlertCircle className="h-6 w-6" />
+            <span className="font-bold text-lg">CRISIS MODE ACTIVATED</span>
+          </div>
+          <div className="text-sm text-red-700 mb-3">
+            Critical risk detected. Immediate professional intervention may be required.
+          </div>
+          <div className="flex gap-2">
+            <button className="bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-700">
+              Emergency Contacts
+            </button>
+            <button className="bg-red-100 text-red-800 border border-red-300 px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-200">
+              View Protocols
+            </button>
+          </div>
+          {isSessionLocked && (
+            <div className="mt-2 text-xs text-red-600">
+              🔒 Session has been locked for safety
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Audio Pipeline Debug */}
       {isRecording && (
@@ -348,14 +490,153 @@ export default function ConnectionTroubleshooter() {
         </div>
       )}
 
+      {/* Controls */}
+      <div className="bg-white border rounded-lg p-4">
+        <h3 className="font-semibold mb-4">Controls</h3>
+        <div className="flex flex-wrap gap-3">
+          {/* Recording Controls */}
+          <button
+            onClick={canStartRecording ? startRecording : undefined}
+            disabled={!canStartRecording}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+              canStartRecording
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+            }`}
+          >
+            <Play className="h-4 w-4" />
+            Start Recording
+          </button>
+
+          <button
+            onClick={stopRecording}
+            disabled={!isRecording}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+              isRecording
+                ? 'bg-gray-700 text-white hover:bg-gray-800'
+                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+            }`}
+          >
+            <Square className="h-4 w-4" />
+            Stop Recording
+          </button>
+
+          {/* Connection Controls */}
+          <button
+            onClick={reconnect}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Reconnect
+          </button>
+
+          <button
+            onClick={disconnect}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg font-medium hover:bg-gray-700"
+          >
+            <WifiOff className="h-4 w-4" />
+            Disconnect
+          </button>
+
+          {/* Utility Controls */}
+          <button
+            onClick={resetSession}
+            className="flex items-center gap-2 px-4 py-2 bg-yellow-600 text-white rounded-lg font-medium hover:bg-yellow-700"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Reset Session
+          </button>
+
+          <button
+            onClick={clearMessages}
+            className="px-4 py-2 bg-gray-500 text-white rounded-lg font-medium hover:bg-gray-600"
+          >
+            Clear Messages
+          </button>
+        </div>
+      </div>
+
+      {/* Backend Health Check */}
+      <div className="bg-white border border-gray-200 rounded-lg p-6">
+        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <Server className="h-5 w-5" />
+          Backend Health & Stats
+        </h2>
+        
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              {isBackendHealthy === null ? (
+                <Clock className="h-5 w-5 text-gray-400" />
+              ) : isBackendHealthy ? (
+                <CheckCircle className="h-5 w-5 text-green-500" />
+              ) : (
+                <XCircle className="h-5 w-5 text-red-500" />
+              )}
+              <span className="font-medium">Backend Server</span>
+            </div>
+            <button
+              onClick={checkBackendHealth}
+              disabled={healthCheckLoading}
+              className="px-3 py-1 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50"
+            >
+              {healthCheckLoading ? 'Checking...' : 'Check Status'}
+            </button>
+          </div>
+
+          {/* WebSocket Stats */}
+          {wsStats && (
+            <div className="bg-blue-50 rounded-lg p-3">
+              <div className="text-sm font-medium text-blue-800 mb-2">WebSocket Server Stats</div>
+              <div className="grid grid-cols-2 gap-4 text-xs">
+                <div>
+                  <span className="text-blue-600">Active Connections:</span>
+                  <span className="ml-1 font-medium">{wsStats.active_connections || 0}</span>
+                </div>
+                <div>
+                  <span className="text-blue-600">STT Connections:</span>
+                  <span className={`ml-1 font-medium ${wsStats.stt_connections > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                    {wsStats.stt_connections || 0}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-blue-600">STT Provider:</span>
+                  <span className="ml-1 font-medium">{wsStats.stt_provider || 'N/A'}</span>
+                </div>
+                <div>
+                  <span className="text-blue-600">Endpoint:</span>
+                  <span className="ml-1 font-medium">:8000</span>
+                </div>
+              </div>
+              
+              {wsStats.stt_connections > 0 && (
+                <div className="mt-2 p-2 bg-yellow-100 border border-yellow-300 rounded text-xs text-yellow-800">
+                  ⚠️ <strong>STT sessions active:</strong> {wsStats.stt_connections}. 
+                  Close other tabs or wait 15 seconds for cleanup.
+                </div>
+              )}
+            </div>
+          )}
+
+          {isBackendHealthy === false && (
+            <div className="bg-red-50 border border-red-200 rounded p-3 text-sm text-red-700">
+              ❌ Backend not reachable at <code>http://localhost:8000</code>
+              <div className="mt-1 text-xs">
+                Make sure your FastAPI server is running with: <code>uvicorn main:app --reload --port 8000</code>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Real-time Messages */}
       <div className="bg-white border rounded-lg p-4">
         <h3 className="font-semibold mb-4">
           Real-time Messages ({messages.length} total)
         </h3>
         
-        {/* Message Type Summary */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-xs">
+        {/* Enhanced Message Type Summary */}
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-2 mb-4 text-xs">
           <div className="bg-blue-50 p-2 rounded">
             <div className="font-medium text-blue-800">Audio Chunks</div>
             <div className="text-blue-600">{messages.filter(m => m.type === 'audio_received').length}</div>
@@ -366,7 +647,15 @@ export default function ConnectionTroubleshooter() {
           </div>
           <div className="bg-purple-50 p-2 rounded">
             <div className="font-medium text-purple-800">Final Transcripts</div>
-            <div className="text-purple-600">{transcriptions.filter(t => t.data.is_final).length}</div>
+            <div className="text-purple-600">{finalTranscripts.length}</div>
+          </div>
+          <div className="bg-orange-50 p-2 rounded">
+            <div className="font-medium text-orange-800">Risk Assessments</div>
+            <div className="text-orange-600">{messages.filter(m => m.type === 'risk_assessment').length}</div>
+          </div>
+          <div className="bg-red-50 p-2 rounded">
+            <div className="font-medium text-red-800">Warnings/Crises</div>
+            <div className="text-red-600">{messages.filter(m => m.type === 'risk_warning' || m.type === 'crisis_detected').length}</div>
           </div>
           <div className="bg-yellow-50 p-2 rounded">
             <div className="font-medium text-yellow-800">Errors</div>
@@ -385,6 +674,9 @@ export default function ConnectionTroubleshooter() {
                   msg.type === 'transcription' ? 'border-blue-400 bg-blue-50' :
                   msg.type === 'connection_established' ? 'border-green-400 bg-green-50' :
                   msg.type === 'stt_ready' ? 'border-green-400 bg-green-50' :
+                  msg.type === 'risk_assessment' ? 'border-orange-400 bg-orange-50' :
+                  msg.type === 'risk_warning' ? 'border-yellow-400 bg-yellow-50' :
+                  msg.type === 'crisis_detected' ? 'border-red-400 bg-red-50' :
                   msg.type === 'audio_received' ? 'border-gray-400 bg-gray-50' :
                   msg.type === 'error' ? 'border-red-400 bg-red-50' :
                   'border-gray-400 bg-gray-50'
@@ -392,7 +684,10 @@ export default function ConnectionTroubleshooter() {
               >
                 <div className="flex items-center justify-between">
                   <div className="font-medium text-xs uppercase text-gray-600">
-                    {msg.type}
+                    {msg.type === 'risk_assessment' ? '📊 RISK ASSESSMENT' :
+                     msg.type === 'risk_warning' ? '⚠️ RISK WARNING' :
+                     msg.type === 'crisis_detected' ? '🚨 CRISIS DETECTED' :
+                     msg.type}
                   </div>
                   <div className="text-xs text-gray-500">
                     {new Date(msg.timestamp).toLocaleTimeString()}
@@ -404,13 +699,46 @@ export default function ConnectionTroubleshooter() {
                       {msg.data.is_final ? '🔸 FINAL: ' : '🔹 PARTIAL: '}
                       "{msg.data.text}"
                       <span className="text-xs text-gray-500 ml-2">
-                        (confidence: {(msg.data.confidence * 100).toFixed(1)}%)
+                        (confidence: {((msg.data.confidence || 0) * 100).toFixed(1)}%)
                       </span>
                     </span>
+                  ) : msg.type === 'risk_assessment' ? (
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg">{getMentalStateEmoji(msg.data?.mental_state || 'calm')}</span>
+                        <span className="font-medium">Risk: {msg.data?.risk_level || 'low'} ({((msg.data?.risk_score || 0) * 100).toFixed(0)}%)</span>
+                        <span className="capitalize">State: {msg.data?.mental_state || 'calm'}</span>
+                      </div>
+                      {msg.data?.top_emotions && msg.data.top_emotions.length > 0 && (
+                        <div className="text-xs">
+                          Emotions: {msg.data.top_emotions.join(', ')}
+                        </div>
+                      )}
+                      <div className="text-xs text-gray-600">{msg.data?.explanation || ''}</div>
+                    </div>
+                  ) : msg.type === 'risk_warning' ? (
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg">⚠️</span>
+                        <span className="font-medium">Warning: {msg.data?.risk_level || 'medium'} ({((msg.data?.risk_score || 0) * 100).toFixed(0)}%)</span>
+                      </div>
+                      <div className="text-xs text-gray-600">{msg.data?.explanation || ''}</div>
+                    </div>
+                  ) : msg.type === 'crisis_detected' ? (
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg">🚨</span>
+                        <span className="font-bold text-red-800">CRISIS: {((msg.data?.risk_score || 0) * 100).toFixed(0)}% risk</span>
+                      </div>
+                      <div className="text-xs text-red-700 font-medium">{msg.data?.explanation || ''}</div>
+                      {msg.data?.immediate_action_required && (
+                        <div className="text-xs text-red-800 font-bold">⚡ IMMEDIATE ACTION REQUIRED</div>
+                      )}
+                    </div>
                   ) : msg.type === 'audio_received' ? (
                     <span className="text-xs text-gray-600">
-                      📡 Chunk {msg.data.chunk_number}: {msg.data.total_samples} samples 
-                      ({msg.data.duration_seconds?.toFixed(3)}s)
+                      📡 Chunk {msg.data?.chunk_number}: {msg.data?.total_samples} samples 
+                      ({msg.data?.duration_seconds?.toFixed(3)}s)
                     </span>
                   ) : (
                     <pre className="text-xs text-gray-700 whitespace-pre-wrap">

@@ -1,9 +1,8 @@
-// src/hooks/useWebSocket.ts
+// src/hooks/useWebSocket.ts - Complete Enhanced Version
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { getErrorMessage, handleWebSocketError, handleMediaError } from "../lib/errorUtils";
 
 export interface WSMessage {
-  type: "connection_established" | "stt_ready" | "audio_received" | "transcription" | "risk_assessment" | "crisis_detected" | "session_summary" | "error" | "session_locked" | "stt_error";
+  type: "connection_established" | "stt_ready" | "audio_received" | "transcription" | "risk_assessment" | "crisis_detected" | "session_summary" | "error" | "session_locked" | "stt_error" | "risk_warning";
   session_id: string;
   data: any;
   timestamp: string;
@@ -21,10 +20,35 @@ export interface TranscriptPayload {
 
 export interface RiskPayload {
   risk_score: number;
-  risk_level: "low" | "medium" | "high";
+  risk_level: "low" | "medium" | "high" | "critical";
+  mental_state: "calm" | "stressed" | "anxious" | "depressed" | "suicidal";
+  top_emotions: string[];
   explanation: string;
   recommendations: string[];
-  transcript_analyzed: string;
+  window_context?: {
+    words_analyzed: number;
+    transcripts_count: number;
+    window_seconds: number;
+  };
+}
+
+export interface CrisisPayload {
+  risk_score: number;
+  risk_level: "critical";
+  mental_state: "suicidal";
+  explanation: string;
+  immediate_action_required: boolean;
+  session_locked: boolean;
+  emergency_contacts: string;
+  recommendations: string[];
+}
+
+export interface RiskWarningPayload {
+  risk_score: number;
+  risk_level: "medium";
+  mental_state: "stressed" | "anxious";
+  explanation: string;
+  recommendations: string[];
 }
 
 export interface AudioConfig {
@@ -50,9 +74,9 @@ export function useWebSocket(sessionId?: string) {
   const reconnectTimeoutRef = useRef<number | null>(null);
   const connectionAttempts = useRef<number>(0);
   const isManuallyDisconnected = useRef<boolean>(false);
-  const isRecordingActiveRef = useRef<boolean>(false); // Track if recording is active
-  const hasReceivedTranscription = useRef<boolean>(false); // Track if we've received any transcriptions
-  const hasInitialised = useRef<boolean>(false); // ADD THIS - Missing ref declaration
+  const isRecordingActiveRef = useRef<boolean>(false);
+  const hasReceivedTranscription = useRef<boolean>(false);
+  const hasInitialised = useRef<boolean>(false);
   
   // State
   const [messages, setMessages] = useState<WSMessage[]>([]);
@@ -67,6 +91,34 @@ export function useWebSocket(sessionId?: string) {
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [audioConfig, setAudioConfig] = useState<AudioConfig | null>(null);
   const [isProcessingComplete, setIsProcessingComplete] = useState(false);
+  
+  // Enhanced Mental Health Monitoring State
+  const [currentRisk, setCurrentRisk] = useState<{
+    score: number;
+    level: string;
+    mentalState: string;
+    emotions: string[];
+    explanation: string;
+    recommendations: string[];
+    lastUpdated: string;
+    windowContext?: {
+      wordsAnalyzed: number;
+      transcriptCount: number;
+      windowSeconds: number;
+    };
+  }>({
+    score: 0,
+    level: "low",
+    mentalState: "calm",
+    emotions: [],
+    explanation: "",
+    recommendations: [],
+    lastUpdated: "",
+  });
+  
+  const [isCrisisMode, setIsCrisisMode] = useState(false);
+  const [isSessionLocked, setIsSessionLocked] = useState(false);
+  const [finalTranscripts, setFinalTranscripts] = useState<WSMessage[]>([]);
 
   // Generate stable session ID
   const currentSessionId = useMemo(() => {
@@ -102,7 +154,7 @@ export function useWebSocket(sessionId?: string) {
       console.log(`📡 Connecting to WebSocket... (attempt ${connectionAttempts.current + 1})`);
       setConnectionError(null);
       
-      // Fix #1: Use correct WebSocket URL endpoint pointing to backend port 8000
+      // Fixed: Use correct WebSocket URL endpoint pointing to backend port 8000
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const wsUrl = `${proto}://localhost:8000/api/v1/ws/audio/${currentSessionId}`;
       console.log(`🔗 Connecting to: ${wsUrl}`);
@@ -122,7 +174,7 @@ export function useWebSocket(sessionId?: string) {
           
           setMessages(prev => [...prev, message]);
 
-          // Handle specific message types with improved state machine
+          // Handle specific message types with enhanced mental health monitoring
           switch (message.type) {
             case 'connection_established':
               console.log("✅ Connection established - checking STT state...");
@@ -164,9 +216,57 @@ export function useWebSocket(sessionId?: string) {
                 ...prev,
                 lastPartial: message.data.text,
               }));
-              // Check if this is a final transcription
+              
+              // Track final transcripts for mental health analysis
               if (message.data.is_final) {
                 console.log("✅ Received final transcription:", message.data.text);
+                setFinalTranscripts(prev => [...prev.slice(-19), message]); // Keep last 20
+              }
+              break;
+            
+            case 'risk_assessment':
+              console.log("📊 Risk assessment received:", message.data);
+              setCurrentRisk({
+                score: message.data.risk_score,
+                level: message.data.risk_level,
+                mentalState: message.data.mental_state || "calm",
+                emotions: message.data.top_emotions || [],
+                explanation: message.data.explanation,
+                recommendations: message.data.recommendations || [],
+                lastUpdated: message.timestamp,
+                windowContext: message.data.window_context,
+              });
+              break;
+            
+            case 'risk_warning':
+              console.log("⚠️ Risk warning received:", message.data);
+              setCurrentRisk(prev => ({
+                ...prev,
+                score: message.data.risk_score,
+                level: message.data.risk_level,
+                mentalState: message.data.mental_state || "stressed",
+                explanation: message.data.explanation,
+                recommendations: message.data.recommendations || [],
+                lastUpdated: message.timestamp,
+              }));
+              break;
+            
+            case 'crisis_detected':
+              console.log("🚨 CRISIS DETECTED:", message.data);
+              setIsCrisisMode(true);
+              setCurrentRisk({
+                score: message.data.risk_score,
+                level: "critical",
+                mentalState: message.data.mental_state || "suicidal",
+                emotions: [],
+                explanation: message.data.explanation,
+                recommendations: message.data.recommendations || [],
+                lastUpdated: message.timestamp,
+              });
+              
+              if (message.data.session_locked) {
+                setIsSessionLocked(true);
+                console.log("🔒 Session locked due to crisis");
               }
               break;
             
@@ -184,7 +284,6 @@ export function useWebSocket(sessionId?: string) {
               break;
             
             case 'session_summary':
-            case 'crisis_detected':
               console.log("🏁 Session processing complete - safe to close");
               setIsProcessingComplete(true);
               // Auto-close after receiving session end signals
@@ -201,7 +300,7 @@ export function useWebSocket(sessionId?: string) {
               setConnectionError(errorMsg);
               
               // Handle specific errors
-              if (errorMsg.includes("concurrent") || errorMsg.includes("free tier")) {
+              if (errorMsg.includes("free tier") || errorMsg.includes("concurrent")) {
                 console.log("🚫 AssemblyAI free tier limit reached - stopping reconnection");
                 isManuallyDisconnected.current = true;
                 // Show user-friendly message
@@ -213,7 +312,7 @@ export function useWebSocket(sessionId?: string) {
               break;
 
             default:
-              // Other messages like audio_received - no UI impact
+              // Other messages - no UI impact
               break;
           }
         } catch (error) {
@@ -271,7 +370,7 @@ export function useWebSocket(sessionId?: string) {
       return;
     }
 
-    // Fix #4: Wait for STT to be ready before recording
+    // Wait for STT to be ready before recording
     if (!isConnected || sttState.state !== "ready") {
       console.log("❌ Cannot start recording - STT not ready", { 
         connected: isConnected, 
@@ -472,6 +571,14 @@ export function useWebSocket(sessionId?: string) {
     connect();
   }, [connect]);
 
+  const forceReconnect = useCallback(() => {
+    console.log("🔄 Force reconnection requested - resetting state");
+    isManuallyDisconnected.current = false;
+    connectionAttempts.current = 0;
+    setConnectionError(null);
+    connect();
+  }, [connect]);
+
   // Utility functions
   const resetSession = useCallback(() => {
     console.log("🔄 Resetting session state");
@@ -480,20 +587,24 @@ export function useWebSocket(sessionId?: string) {
     connectionAttempts.current = 0;
     setConnectionError(null);
     setIsProcessingComplete(false);
+    setIsCrisisMode(false);
+    setIsSessionLocked(false);
+    setCurrentRisk({
+      score: 0,
+      level: "low",
+      mentalState: "calm",
+      emotions: [],
+      explanation: "",
+      recommendations: [],
+      lastUpdated: "",
+    });
+    setFinalTranscripts([]);
     isManuallyDisconnected.current = false;
   }, []);
 
   const clearMessages = useCallback(() => {
     setMessages([]);
   }, []);
-
-  const forceReconnect = useCallback(() => {
-    console.log("🔄 Force reconnection requested - resetting state");
-    isManuallyDisconnected.current = false;
-    connectionAttempts.current = 0;
-    setConnectionError(null);
-    connect();
-  }, [connect]);
 
   const getSessionSummary = useCallback(() => {
     const transcripts = messages.filter(m => m.type === 'transcription');
@@ -506,92 +617,6 @@ export function useWebSocket(sessionId?: string) {
       sessionDuration: Date.now() - (messages[0]?.timestamp ? new Date(messages[0].timestamp).getTime() : Date.now())
     };
   }, [messages]);
-
-  // Auto-reconnect after delay
-  const autoReconnect = useCallback(() => {
-    if (connectionAttempts.current >= 5) {
-      console.log("❌ Max reconnection attempts reached");
-      return;
-    }
-
-    const delay = Math.min(1000 * Math.pow(2, connectionAttempts.current), 30000);
-    console.log(`🔄 Auto-reconnecting in ${delay}ms... (attempt ${connectionAttempts.current + 1})`);
-    
-    reconnectTimeoutRef.current = window.setTimeout(() => {
-      connectionAttempts.current++;
-      connect();
-    }, delay);
-  }, [connect]);
-
-  // Effect for initial connection - GUARDS AGAINST REACT STRICT MODE (Fix #1)
-  useEffect(() => {
-    // Fix #1: Guard against React Strict Mode double mounting
-    // StrictMode intentionally mounts components twice in development
-    if (hasInitialised.current) {
-      console.log("🚫 Skipping duplicate mount (React Strict Mode)");
-      return;
-    }
-    
-    console.log("📡 Component mounting - initiating WebSocket connection");
-    hasInitialised.current = true;
-    isManuallyDisconnected.current = false;
-    connectionAttempts.current = 0;
-    setIsProcessingComplete(false);
-    connect();
-
-    return () => {
-      console.log("🧹 Component unmounting - checking if cleanup is safe...");
-      
-      // ENHANCED GUARD: Only cleanup if this is a REAL unmount, not StrictMode
-      // In StrictMode, hasInitialised stays true even during cleanup
-      if (!hasInitialised.current) {
-        console.log("⚠️ Skipping cleanup - looks like StrictMode double-mount");
-        return;
-      }
-      
-      // Only reset hasInitialised on real unmount
-      const isRealUnmount = !document.contains(document.querySelector('[data-reactroot]')) ||
-                           isManuallyDisconnected.current ||
-                           (!isRecordingActiveRef.current && !hasReceivedTranscription.current);
-      
-      if (isRealUnmount) {
-        console.log("✅ Real unmount detected - cleaning up WebSocket");
-        hasInitialised.current = false; // Reset for next real mount
-        isManuallyDisconnected.current = true;
-        
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
-        
-        // Clean up audio resources
-        if (audioWorkletNode.current) {
-          audioWorkletNode.current.disconnect();
-          audioWorkletNode.current = null;
-        }
-        
-        if (audioContext.current) {
-          audioContext.current.close();
-          audioContext.current = null;
-        }
-        
-        if (mediaRecorder.current && mediaRecorder.current.state === "recording") {
-          mediaRecorder.current.stop();
-        }
-        
-        if (audioStream.current) {
-          audioStream.current.getTracks().forEach(track => track.stop());
-          audioStream.current = null;
-        }
-        
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          ws.current.close(1000, "Component unmounting");
-        }
-      } else {
-        console.log("⚠️ Ignoring cleanup - StrictMode or partial unmount detected");
-      }
-    };
-  }, []); // Empty dependency array - only run on mount/unmount
 
   // End session properly (wait for server confirmation)
   const endSession = useCallback(async () => {
@@ -640,6 +665,67 @@ export function useWebSocket(sessionId?: string) {
     });
   }, [isRecording, stopRecording, isProcessingComplete]);
 
+  // Effect for initial connection - GUARDS AGAINST REACT STRICT MODE (Fix #1)
+  useEffect(() => {
+    // Fix #1: Guard against React Strict Mode double mounting
+    // StrictMode intentionally mounts components twice in development
+    if (hasInitialised.current) {
+      console.log("🚫 Skipping duplicate mount (React Strict Mode)");
+      return;
+    }
+    
+    console.log("📡 Component mounting - initiating WebSocket connection");
+    hasInitialised.current = true;
+    isManuallyDisconnected.current = false;
+    connectionAttempts.current = 0;
+    setIsProcessingComplete(false);
+    connect();
+
+    return () => {
+      console.log("🧹 Component unmounting - delaying cleanup for WebSocket stability...");
+      
+      // DELAY CLEANUP: Give WebSocket time to establish and receive stt_ready
+      // This prevents StrictMode from interrupting the connection handshake
+      setTimeout(() => {
+        // Only cleanup if still unmounted after delay
+        if (isManuallyDisconnected.current || !ws.current) {
+          console.log("✅ Delayed cleanup confirmed - cleaning up WebSocket");
+          
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+          }
+          
+          // Clean up audio resources
+          if (audioProcessor.current) {
+            audioProcessor.current.disconnect();
+            audioProcessor.current = null;
+          }
+          
+          if (audioContext.current) {
+            audioContext.current.close();
+            audioContext.current = null;
+          }
+          
+          if (mediaRecorder.current && mediaRecorder.current.state === "recording") {
+            mediaRecorder.current.stop();
+          }
+          
+          if (audioStream.current) {
+            audioStream.current.getTracks().forEach(track => track.stop());
+            audioStream.current = null;
+          }
+          
+          if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+            ws.current.close(1000, "Component unmounting");
+          }
+        } else {
+          console.log("⚠️ Cleanup canceled - WebSocket still active");
+        }
+      }, 2000); // 2 second delay allows WebSocket handshake to complete
+    };
+  }, []); // Empty dependency array - only run on mount/unmount
+
   return { 
     messages, 
     isConnected, 
@@ -647,16 +733,22 @@ export function useWebSocket(sessionId?: string) {
     isRecording,
     connectionError,
     audioConfig,
-    isProcessingComplete, // New state to track STT completion
+    isProcessingComplete,
     sessionId: currentSessionId,
     // Expose live transcription text for UI
     lastPartial: sttState.lastPartial,
+    // Enhanced Mental Health Monitoring
+    currentRisk,
+    isCrisisMode,
+    isSessionLocked,
+    finalTranscripts,
+    // Utility functions
     startRecording,
     stopRecording,
     disconnect,
     reconnect,
-    forceReconnect, // Force reconnect after hitting limits
-    endSession, // Proper session ending function
+    forceReconnect,
+    endSession,
     getSessionSummary,
     resetSession,
     clearMessages

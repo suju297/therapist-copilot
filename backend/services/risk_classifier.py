@@ -1,76 +1,73 @@
-"""Simplified risk assessment using Gemini AI."""
+"""Enhanced risk classifier with mental state assessment."""
 
+import asyncio
 import json
 import logging
 from typing import Dict, Any
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import HumanMessage
-
 from config import get_settings
+from services.llm.llm_factory import get_risk_model
+from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 
-
+# Updated prompt with mental state assessment
 RISK_ASSESSMENT_PROMPT = """
-You are a mental health risk assessment AI. Analyze the following therapy session transcript and provide a risk assessment.
+You are a mental-health triage assistant.
 
-IMPORTANT: Focus on identifying immediate safety concerns such as:
-- Suicidal ideation or plans
-- Self-harm behaviors
-- Homicidal thoughts
-- Severe psychosis or disconnection from reality
-- Substance abuse with immediate danger
-- Domestic violence or abuse situations
+Return a JSON object **exactly** like this:
 
-Rate the risk level from 0.0 to 1.0 where:
-- 0.0-0.3: Low risk (general mental health concerns, mild anxiety/depression)
-- 0.4-0.6: Medium risk (moderate symptoms, some concerning behaviors)
-- 0.7-1.0: High risk (immediate safety concerns, requires intervention)
-
-Provide your assessment in this exact JSON format:
 {{
-    "risk_score": <float between 0.0 and 1.0>,
-    "risk_level": "<low|medium|high>",
-    "explanation": "<brief explanation of the assessment>",
-    "recommendations": ["<list of specific recommendations>"]
+  "risk_score": 0.0,               
+  "risk_level": "low|medium|high|critical",
+  "mental_state": "calm|stressed|anxious|depressed|suicidal",
+  "top_emotions": ["sad", "guilty", "..."],
+  "explanation": "...",
+  "recommendations": ["..."]
 }}
 
-Transcript to analyze:
+Guidelines:
+- 0.00-0.30 → calm   / low
+- 0.31-0.60 → stressed|anxious / medium
+- 0.61-0.80 → depressed        / high
+- 0.81-1.00 → suicidal         / critical
+
+Transcript (last {window_seconds} s / ~{window_words} w):
+
 {text}
 """
 
+def _score_to_state(score: float) -> str:
+    """Map risk score to mental state."""
+    if score >= 0.81:
+        return "suicidal"
+    if score >= 0.61:
+        return "depressed"
+    if score >= 0.31:
+        return "stressed"
+    return "calm"
 
-def get_risk_model() -> ChatGoogleGenerativeAI:
-    """Get Gemini model for risk assessment."""
-    settings = get_settings()
-    
-    if not settings.gemini_api_key:
-        raise ValueError("GEMINI_API_KEY is required for risk assessment")
-    
-    return ChatGoogleGenerativeAI(
-        model=settings.llm_model_risk,
-        google_api_key=settings.gemini_api_key,
-        temperature=0.1,  # Low temperature for consistent risk assessment
-        max_tokens=1024,
-        safety_settings={
-            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE", 
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",  # Allow assessment of dangerous content
-        }
-    )
+def _score_to_level(score: float) -> str:
+    """Map risk score to risk level."""
+    if score >= 0.81:
+        return "critical"
+    if score >= 0.61:
+        return "high"
+    if score >= 0.31:
+        return "medium"
+    return "low"
 
-
-async def assess_risk_level(text: str) -> Dict[str, Any]:
+async def assess_risk_level(text: str, window_seconds: int = 45, window_words: int = 250) -> Dict[str, Any]:
     """
-    Assess risk level of the given text using Gemini AI.
+    Assess risk level and mental state from transcript text.
     
     Args:
         text: Transcript text to analyze
+        window_seconds: Time window for context (for prompt)
+        window_words: Word count for context (for prompt)
         
     Returns:
-        Dict containing risk score, level, explanation, and recommendations
+        Dict containing risk score, level, mental state, explanation, and recommendations
     """
     try:
         # Get settings and check if Gemini is configured
@@ -82,8 +79,12 @@ async def assess_risk_level(text: str) -> Dict[str, Any]:
         # Get the Gemini model
         model = get_risk_model()
         
-        # Create the prompt
-        prompt = RISK_ASSESSMENT_PROMPT.format(text=text)
+        # Create the prompt with window context
+        prompt = RISK_ASSESSMENT_PROMPT.format(
+            text=text,
+            window_seconds=window_seconds,
+            window_words=window_words
+        )
         
         # Get response from Gemini
         message = HumanMessage(content=prompt)
@@ -98,7 +99,7 @@ async def assess_risk_level(text: str) -> Dict[str, Any]:
             return _fallback_risk_assessment(text)
         
         # Validate the response structure
-        required_fields = ["risk_score", "risk_level", "explanation"]
+        required_fields = ["risk_score", "risk_level", "mental_state", "explanation"]
         for field in required_fields:
             if field not in result:
                 logger.error(f"Missing required field: {field}")
@@ -107,14 +108,11 @@ async def assess_risk_level(text: str) -> Dict[str, Any]:
         # Ensure risk_score is within valid range
         result["risk_score"] = max(0.0, min(1.0, float(result["risk_score"])))
         
-        # Ensure risk_level matches score
-        score = result["risk_score"]
-        if score <= 0.3:
-            result["risk_level"] = "low"
-        elif score <= 0.6:
-            result["risk_level"] = "medium"
-        else:
-            result["risk_level"] = "high"
+        # Auto-correct mental_state based on score if mismatch
+        result["mental_state"] = _score_to_state(result["risk_score"])
+        
+        # Auto-correct risk_level based on score if mismatch
+        result["risk_level"] = _score_to_level(result["risk_score"])
         
         # Ensure recommendations is a list
         if "recommendations" not in result:
@@ -122,7 +120,13 @@ async def assess_risk_level(text: str) -> Dict[str, Any]:
         elif not isinstance(result["recommendations"], list):
             result["recommendations"] = [str(result["recommendations"])]
         
-        logger.info(f"Risk assessment completed: {result['risk_level']} ({result['risk_score']:.2f})")
+        # Ensure top_emotions is a list
+        if "top_emotions" not in result:
+            result["top_emotions"] = []
+        elif not isinstance(result["top_emotions"], list):
+            result["top_emotions"] = [str(result["top_emotions"])]
+        
+        logger.info(f"Risk assessment completed: {result['mental_state']} / {result['risk_level']} ({result['risk_score']:.2f})")
         return result
         
     except Exception as e:
@@ -133,66 +137,92 @@ async def assess_risk_level(text: str) -> Dict[str, Any]:
 def _fallback_risk_assessment(text: str) -> Dict[str, Any]:
     """
     Fallback risk assessment using simple keyword matching.
-    
-    Args:
-        text: Text to analyze
-        
-    Returns:
-        Basic risk assessment result
+    Enhanced with mental state detection.
     """
-    try:
-        # Simple keyword-based risk assessment
-        high_risk_keywords = [
-            "kill myself", "suicide", "end it all", "don't want to live",
-            "hurt myself", "cut myself", "overdose", "jump off",
-            "kill someone", "hurt others", "violent thoughts"
+    text_lower = text.lower()
+    
+    # Crisis keywords (immediate high risk)
+    crisis_keywords = [
+        "kill myself", "end my life", "want to die", "suicide", "suicidal",
+        "hurt myself", "self harm", "can't go on", "better off dead",
+        "no point living", "end it all"
+    ]
+    
+    # Depression keywords  
+    depression_keywords = [
+        "hopeless", "worthless", "useless", "failure", "depressed",
+        "empty", "numb", "alone", "isolated", "burden"
+    ]
+    
+    # Anxiety/stress keywords
+    anxiety_keywords = [
+        "anxious", "panic", "worried", "scared", "terrified",
+        "overwhelmed", "stressed", "can't cope", "losing control"
+    ]
+    
+    # Calculate scores
+    crisis_score = sum(1 for keyword in crisis_keywords if keyword in text_lower)
+    depression_score = sum(1 for keyword in depression_keywords if keyword in text_lower)
+    anxiety_score = sum(1 for keyword in anxiety_keywords if keyword in text_lower)
+    
+    # Determine risk score
+    if crisis_score > 0:
+        risk_score = 0.85 + min(0.15, crisis_score * 0.05)
+    elif depression_score >= 2:
+        risk_score = 0.65 + min(0.15, depression_score * 0.05)
+    elif anxiety_score >= 2:
+        risk_score = 0.35 + min(0.25, anxiety_score * 0.05)
+    elif depression_score >= 1 or anxiety_score >= 1:
+        risk_score = 0.25 + min(0.20, (depression_score + anxiety_score) * 0.05)
+    else:
+        risk_score = 0.1
+    
+    # Cap at 1.0
+    risk_score = min(1.0, risk_score)
+    
+    # Map to mental state and risk level
+    mental_state = _score_to_state(risk_score)
+    risk_level = _score_to_level(risk_score)
+    
+    # Generate explanation
+    if crisis_score > 0:
+        explanation = f"Crisis language detected: found {crisis_score} crisis indicators"
+        recommendations = [
+            "Immediate professional intervention recommended",
+            "Contact emergency services if imminent danger",
+            "Ensure client safety and supervision"
         ]
-        
-        medium_risk_keywords = [
-            "hopeless", "worthless", "trapped", "burden",
-            "can't go on", "overwhelmed", "desperate",
-            "angry", "rage", "hate everyone"
+        emotions = ["despair", "hopeless", "suicidal"]
+    elif depression_score >= 2:
+        explanation = f"Multiple depression indicators detected: {depression_score} markers found"
+        recommendations = [
+            "Consider depression screening tools",
+            "Explore mood tracking and behavioral interventions",
+            "Monitor for worsening symptoms"
         ]
-        
-        text_lower = text.lower()
-        
-        # Count keyword matches
-        high_risk_count = sum(1 for keyword in high_risk_keywords if keyword in text_lower)
-        medium_risk_count = sum(1 for keyword in medium_risk_keywords if keyword in text_lower)
-        
-        # Calculate risk score
-        risk_score = 0.1  # Base risk
-        risk_score += high_risk_count * 0.3  # High risk keywords add more
-        risk_score += medium_risk_count * 0.1  # Medium risk keywords add less
-        risk_score = min(1.0, risk_score)  # Cap at 1.0
-        
-        # Determine risk level
-        if risk_score >= 0.7:
-            risk_level = "high"
-            explanation = f"High-risk language detected ({high_risk_count} high-risk keywords)"
-            recommendations = ["Immediate professional intervention recommended", "Contact crisis hotline"]
-        elif risk_score >= 0.4:
-            risk_level = "medium"
-            explanation = f"Moderate risk indicators present ({medium_risk_count} concerning keywords)"
-            recommendations = ["Monitor closely", "Consider professional consultation"]
-        else:
-            risk_level = "low"
-            explanation = "No significant risk indicators detected"
-            recommendations = ["Continue standard care"]
-        
-        return {
-            "risk_score": risk_score,
-            "risk_level": risk_level,
-            "explanation": explanation,
-            "recommendations": recommendations
-        }
-        
-    except Exception as e:
-        logger.error(f"Fallback risk assessment failed: {e}")
-        # Ultimate fallback
-        return {
-            "risk_score": 0.5,
-            "risk_level": "medium",
-            "explanation": f"Risk assessment error: {str(e)}",
-            "recommendations": ["Manual review required due to assessment error"]
-        }
+        emotions = ["sad", "hopeless", "empty"]
+    elif anxiety_score >= 2:
+        explanation = f"Elevated anxiety indicators: {anxiety_score} stress markers found"
+        recommendations = [
+            "Explore anxiety management techniques",
+            "Consider relaxation and breathing exercises",
+            "Identify triggers and coping strategies"
+        ]
+        emotions = ["anxious", "worried", "overwhelmed"]
+    else:
+        explanation = "No significant risk indicators detected in current text"
+        recommendations = [
+            "Continue supportive listening",
+            "Maintain therapeutic rapport",
+            "Monitor for changes"
+        ]
+        emotions = ["calm"]
+    
+    return {
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "mental_state": mental_state,
+        "top_emotions": emotions,
+        "explanation": explanation,
+        "recommendations": recommendations
+    }

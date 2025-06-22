@@ -19,6 +19,11 @@ from services.risk_classifier import assess_risk_level
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# --- Gemini load-shedding thresholds ---
+WINDOW_SECONDS = 45        # sliding window length
+WINDOW_WORDS = 250         # cap context size  
+MIN_INTERVAL_SEC = 15      # cool-down between Gemini calls
+
 
 class ConnectionManager:
     """Manages WebSocket connections for audio streaming."""
@@ -28,6 +33,7 @@ class ConnectionManager:
         self.session_states: Dict[UUID, Dict[str, Any]] = {}
         self.session_transcripts: Dict[UUID, list] = {}  # In-memory transcript storage
         self._ws_lock: Dict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)  # Serialize WebSocket writes
+        self.gemini_last_called: Dict[UUID, float] = defaultdict(lambda: 0.0)  # Throttle Gemini calls
         self.stt_service = None
         self._initialize_stt_service()
     
@@ -68,6 +74,9 @@ class ConnectionManager:
             del self.session_states[session_id]
         if session_id in self.session_transcripts:
             del self.session_transcripts[session_id]
+        
+        # Cleanup Gemini throttling
+        self.gemini_last_called.pop(session_id, None)
         
         # Cleanup audio buffer
         remove_audio_buffer(session_id)
@@ -244,9 +253,10 @@ async def websocket_audio_stream(websocket: WebSocket, session_id: UUID):
                 },
                 "risk_threshold": settings.risk_threshold,
                 "stt_provider": settings.stt_provider,
-                "stt_state": "ready"  # ← ADD THIS LINE!
+                "stt_state": "ready"  # ← CRITICAL: Tell frontend STT is ready
             }
         )
+        
         logger.info(f"connection_established sent to session {session_id} after STT confirmation")
         
         # Main message loop
@@ -338,17 +348,55 @@ async def handle_audio_chunk(session_id: UUID, audio_data: bytes, audio_buffer, 
         )
 
 
-async def check_transcript_risks(session_id: UUID, transcript_text: str):
-    """Check transcript for risks and apply guardrails."""
+async def check_transcript_risks(session_id: UUID, latest_text: str):
+    """Check transcript for risks with sliding window and throttling."""
+    now = datetime.utcnow().timestamp()
+    
+    # Check throttling - don't spam Gemini
+    if now - manager.gemini_last_called[session_id] < MIN_INTERVAL_SEC:
+        logger.debug(f"Gemini call throttled for session {session_id} (cooling down)")
+        return
+    
+    # Build sliding window of recent transcripts
+    tx = manager.session_transcripts.get(session_id, [])
+    
+    # Keep only last WINDOW_SECONDS worth of transcripts
+    cutoff = datetime.utcnow().timestamp() - WINDOW_SECONDS
+    recent = []
+    
+    for t in tx:
+        try:
+            # Parse timestamp and check if within window
+            timestamp = datetime.fromisoformat(t["timestamp"]).timestamp()
+            if timestamp > cutoff:
+                recent.append(t["text"])
+        except (ValueError, KeyError):
+            # Skip malformed timestamps
+            continue
+    
+    # Join recent text and cap at WINDOW_WORDS (rough estimate: 6 chars per word)
+    window_text = " ".join(recent)
+    if len(window_text) > WINDOW_WORDS * 6:
+        window_text = window_text[-(WINDOW_WORDS * 6):]
+    
+    # Skip if too little content for meaningful analysis
+    word_count = len(window_text.split())
+    if word_count < 10:
+        logger.debug(f"Skipping risk assessment for session {session_id} - insufficient content ({word_count} words)")
+        return
+    
+    # Lock the throttle before calling Gemini
+    manager.gemini_last_called[session_id] = now
+    
+    logger.info(f"Running risk assessment for session {session_id} ({word_count} words, {len(recent)} recent transcripts)")
+    
     try:
-        # Get fresh settings for risk threshold
-        settings = get_settings()
-        
-        # Perform risk assessment
-        risk_result = await assess_risk_level(transcript_text)
+        # Perform enhanced risk assessment with mental state
+        risk_result = await assess_risk_level(window_text, WINDOW_SECONDS, min(word_count, WINDOW_WORDS))
         
         risk_score = risk_result["risk_score"]
         risk_level = risk_result["risk_level"]
+        mental_state = risk_result["mental_state"]
         
         # Update session state with risk info
         if session_id in manager.session_states:
@@ -357,20 +405,29 @@ async def check_transcript_risks(session_id: UUID, transcript_text: str):
                 manager.session_states[session_id]["highest_risk_score"] = risk_score
                 manager.session_states[session_id]["risk_level"] = risk_level
         
-        # Send risk assessment to client
+        # Send enhanced risk assessment to client
         await manager.broadcast_to_session(
             session_id,
             "risk_assessment",
             {
                 "risk_score": risk_score,
                 "risk_level": risk_level,
+                "mental_state": mental_state,
+                "top_emotions": risk_result.get("top_emotions", []),
                 "explanation": risk_result["explanation"],
                 "recommendations": risk_result.get("recommendations", []),
-                "transcript_analyzed": transcript_text[:100] + "..." if len(transcript_text) > 100 else transcript_text
+                "window_context": {
+                    "words_analyzed": word_count,
+                    "transcripts_count": len(recent),
+                    "window_seconds": WINDOW_SECONDS
+                }
             }
         )
         
-        # Check if immediate action is required
+        # Get fresh settings for risk threshold
+        settings = get_settings()
+        
+        # Check if immediate action is required (crisis level)
         if risk_score >= settings.risk_threshold:
             # Lock session for high risk
             if session_id in manager.session_states:
@@ -383,34 +440,41 @@ async def check_transcript_risks(session_id: UUID, transcript_text: str):
                 {
                     "risk_score": risk_score,
                     "risk_level": risk_level,
+                    "mental_state": mental_state,
                     "explanation": risk_result["explanation"],
                     "immediate_action_required": True,
                     "session_locked": True,
-                    "emergency_contacts": "Contact emergency services if needed"
+                    "emergency_contacts": "Contact emergency services if needed",
+                    "recommendations": risk_result.get("recommendations", [])
                 }
             )
             
-            logger.warning(f"CRISIS DETECTED - Session {session_id}: Risk score {risk_score}")
+            logger.warning(f"CRISIS DETECTED - Session {session_id}: {mental_state} / {risk_level} (score: {risk_score:.2f})")
         
-        elif risk_level in ["medium", "moderate"]:
-            # Send warning for medium risk
+        elif risk_level in ["medium", "moderate", "high"]:
+            # Send warning for elevated risk
             await manager.broadcast_to_session(
                 session_id,
                 "risk_warning",
                 {
                     "risk_score": risk_score,
                     "risk_level": risk_level,
+                    "mental_state": mental_state,
                     "explanation": risk_result["explanation"],
                     "recommendations": risk_result.get("recommendations", [])
                 }
             )
+            
+            logger.info(f"ELEVATED RISK - Session {session_id}: {mental_state} / {risk_level} (score: {risk_score:.2f})")
+        else:
+            logger.debug(f"Low risk - Session {session_id}: {mental_state} / {risk_level} (score: {risk_score:.2f})")
     
     except Exception as e:
         logger.error(f"Risk assessment failed for session {session_id}: {e}")
         await manager.broadcast_to_session(
             session_id,
             "risk_error",
-            {"message": "Risk assessment failed"}
+            {"message": "Risk assessment failed", "error": str(e)}
         )
 
 

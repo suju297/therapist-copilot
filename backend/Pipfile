@@ -21,6 +21,7 @@ aiofiles = "*"
 pydantic-settings = "*"
 python-dotenv = "*"
 websockets = "<13,>=11"
+langchain-ollama = "*"
 
 [dev-packages]
 pytest = "*"
