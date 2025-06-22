@@ -1,38 +1,34 @@
-"""Risk assessment endpoints for therapy sessions."""
+"""Risk assessment endpoints."""
 
 import logging
 from typing import Dict, Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from services.risk_classifier import assess_risk_level
-from config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-settings = get_settings()
 
 
 class RiskAssessmentRequest(BaseModel):
     """Request model for risk assessment."""
-    text: str = Field(..., description="Transcript text to assess for risk")
-    context: str = Field(default="", description="Additional context for assessment")
+    text: str
 
 
 class RiskAssessmentResponse(BaseModel):
     """Response model for risk assessment."""
-    risk_score: float = Field(..., description="Risk score from 0.0 to 1.0")
-    risk_level: str = Field(..., description="Risk level: low, medium, or high")
-    explanation: str = Field(..., description="Explanation of the risk assessment")
-    recommendations: list = Field(default=[], description="List of recommendations")
-    immediate_action_required: bool = Field(default=False, description="Whether immediate action is required")
+    risk_score: float
+    risk_level: str
+    explanation: str
+    recommendations: list
 
 
 @router.post("/assess", response_model=RiskAssessmentResponse)
 async def assess_risk(request: RiskAssessmentRequest):
     """
-    Assess risk level of given transcript text.
+    Assess risk level of the given text.
     
     Args:
         request: Risk assessment request containing text to analyze
@@ -41,84 +37,51 @@ async def assess_risk(request: RiskAssessmentRequest):
         Risk assessment result with score, level, and recommendations
     """
     try:
-        if not request.text.strip():
+        if not request.text or not request.text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
         
-        # Combine text and context if provided
-        full_text = request.text
-        if request.context:
-            full_text = f"{request.context}\n\n{request.text}"
-        
-        logger.info(f"Performing risk assessment on text: {request.text[:100]}...")
+        logger.info(f"Assessing risk for text: {request.text[:100]}...")
         
         # Perform risk assessment
-        result = await assess_risk_level(full_text)
+        result = await assess_risk_level(request.text.strip())
         
-        # Check if assessment was successful
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=f"Risk assessment failed: {result['error']}")
+        logger.info(f"Risk assessment completed: {result['risk_level']} ({result['risk_score']:.2f})")
         
-        response = RiskAssessmentResponse(
+        return RiskAssessmentResponse(
             risk_score=result["risk_score"],
             risk_level=result["risk_level"],
             explanation=result["explanation"],
-            recommendations=result.get("recommendations", []),
-            immediate_action_required=result["risk_score"] >= settings.risk_threshold
+            recommendations=result.get("recommendations", [])
         )
-        
-        logger.info(f"Risk assessment completed: {response.risk_level} ({response.risk_score:.2f})")
-        
-        # Log high-risk assessments
-        if response.risk_score >= settings.risk_threshold:
-            logger.warning(f"HIGH RISK DETECTED: Score {response.risk_score:.2f} - {response.explanation}")
-        
-        return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Risk assessment endpoint failed: {e}")
-        raise HTTPException(status_code=500, detail="Risk assessment service error")
-
-
-@router.get("/threshold")
-async def get_risk_threshold():
-    """Get current risk threshold configuration."""
-    return {
-        "risk_threshold": settings.risk_threshold,
-        "description": "Scores at or above this threshold are considered high risk",
-        "levels": {
-            "low": "0.0 - 0.3",
-            "medium": "0.4 - 0.6", 
-            "high": "0.7 - 1.0"
-        }
-    }
+        logger.error(f"Risk assessment failed: {e}")
+        # Return medium risk as a safe fallback
+        return RiskAssessmentResponse(
+            risk_score=0.5,
+            risk_level="medium",
+            explanation=f"Risk assessment error: {str(e)}",
+            recommendations=["Manual review required due to assessment error"]
+        )
 
 
 @router.get("/status")
-async def get_risk_service_status():
+async def get_risk_assessment_status():
     """Get risk assessment service status."""
-    try:
-        # Test the service with a simple, safe text
-        test_result = await assess_risk_level("I feel good today.")
-        service_available = "error" not in test_result
-        
-        return {
-            "service_available": service_available,
-            "risk_threshold": settings.risk_threshold,
-            "llm_provider": settings.llm_provider,
-            "llm_model": settings.llm_model_risk,
-            "gemini_configured": bool(settings.gemini_api_key),
-            "test_result": test_result if service_available else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Risk service status check failed: {e}")
-        return {
-            "service_available": False,
-            "error": str(e),
-            "risk_threshold": settings.risk_threshold,
-            "llm_provider": settings.llm_provider,
-            "llm_model": settings.llm_model_risk,
-            "gemini_configured": bool(settings.gemini_api_key)
-        }
+    from config import get_settings
+    
+    settings = get_settings()
+    
+    # Check if Gemini API is configured
+    gemini_configured = bool(settings.gemini_api_key and len(settings.gemini_api_key) > 10)
+    
+    return {
+        "service_available": gemini_configured,
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.llm_model_risk,
+        "risk_threshold": settings.risk_threshold,
+        "status": "configured" if gemini_configured else "not_configured",
+        "warnings": [] if gemini_configured else ["Gemini API key not configured"]
+    }

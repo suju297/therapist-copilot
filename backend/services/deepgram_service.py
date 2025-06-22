@@ -1,17 +1,13 @@
-"""Deepgram service for speech-to-text transcription."""
+"""Deepgram service for real-time speech-to-text transcription."""
 
 import asyncio
 import json
 import logging
-import os
-import tempfile
-import time
 from typing import Dict, Any, Optional, Callable
 from uuid import UUID
 
-import websocket
-from deepgram import DeepgramClient, PrerecordedOptions, FileSource
-from deepgram.clients.prerecorded.v1 import PrerecordedResponse
+from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents
+from deepgram.clients.live.v1 import LiveOptions
 
 from config import get_settings
 
@@ -20,21 +16,27 @@ settings = get_settings()
 
 
 class DeepgramSTTService:
-    """Service for speech-to-text using Deepgram."""
+    """Service for real-time speech-to-text using Deepgram."""
     
     def __init__(self):
         self.settings = get_settings()
         self.client: Optional[DeepgramClient] = None
+        self.connections: Dict[UUID, Any] = {}  # session_id -> connection
         self._initialize_client()
     
     def _initialize_client(self):
         """Initialize Deepgram client."""
         try:
             if not self.settings.deepgram_api_key:
-                logger.warning("Deepgram API key not configured")
+                logger.error("DEEPGRAM_API_KEY not found in environment variables")
                 return
             
-            self.client = DeepgramClient(self.settings.deepgram_api_key)
+            config = DeepgramClientOptions(
+                api_key=self.settings.deepgram_api_key,
+                verbose=self.settings.debug
+            )
+            
+            self.client = DeepgramClient(config)
             logger.info("Deepgram client initialized successfully")
             
         except Exception as e:
@@ -45,322 +47,198 @@ class DeepgramSTTService:
         """Check if Deepgram service is available."""
         return self.client is not None and bool(self.settings.deepgram_api_key)
     
-    async def transcribe_file(self, audio_file_path: str) -> Dict[str, Any]:
-        """Transcribe audio file using Deepgram prerecorded API."""
+    async def start_real_time_transcription(
+        self,
+        session_id: UUID,
+        on_message_callback: Callable[[Dict[str, Any]], None],
+        on_error_callback: Optional[Callable[[str], None]] = None
+    ) -> bool:
+        """Start real-time transcription for a session."""
+        
+        if not self.is_available():
+            logger.error("Deepgram service not available")
+            return False
+        
         try:
-            if not self.client:
-                raise Exception("Deepgram client not available")
+            # Configure live transcription options
+            options = LiveOptions(
+                model=self.settings.deepgram_model,
+                language=self.settings.deepgram_language,
+                encoding=self.settings.deepgram_encoding,
+                sample_rate=self.settings.deepgram_sample_rate,
+                channels=1,
+                punctuate=True,
+                smart_format=True,
+                interim_results=True,
+                utterance_end_ms=1000,
+                vad_events=True,
+                endpointing=300
+            )
             
-            if not os.path.exists(audio_file_path):
-                raise Exception(f"Audio file not found: {audio_file_path}")
+            # Create live connection
+            dg_connection = self.client.listen.live.v("1")
             
-            logger.debug(f"Transcribing audio file: {audio_file_path}")
+            # Set up event handlers
+            def on_open(self, open, **kwargs):
+                logger.info(f"Deepgram connection opened for session {session_id}")
             
-            # Read audio file
+            def on_message(self, result, **kwargs):
+                try:
+                    sentence = result.channel.alternatives[0].transcript
+                    
+                    if sentence:
+                        transcript_data = {
+                            "text": sentence,
+                            "is_final": result.is_final,
+                            "confidence": result.channel.alternatives[0].confidence,
+                            "start": result.start,
+                            "duration": result.duration,
+                            "session_id": str(session_id),
+                            "timestamp": result.metadata.request_id if result.metadata else None
+                        }
+                        
+                        # Call the callback function
+                        if on_message_callback:
+                            on_message_callback(transcript_data)
+                
+                except Exception as e:
+                    logger.error(f"Error processing Deepgram message: {e}")
+            
+            def on_error(self, error, **kwargs):
+                logger.error(f"Deepgram error for session {session_id}: {error}")
+                if on_error_callback:
+                    on_error_callback(str(error))
+            
+            def on_close(self, close, **kwargs):
+                logger.info(f"Deepgram connection closed for session {session_id}")
+            
+            # Register event handlers
+            dg_connection.on(LiveTranscriptionEvents.Open, on_open)
+            dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+            dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+            dg_connection.on(LiveTranscriptionEvents.Close, on_close)
+            
+            # Start the connection (not async)
+            if not dg_connection.start(options):
+                logger.error(f"Failed to start Deepgram connection for session {session_id}")
+                return False
+            
+            # Store connection
+            self.connections[session_id] = dg_connection
+            
+            logger.info(f"Deepgram real-time transcription started for session {session_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start Deepgram transcription for session {session_id}: {e}")
+            return False
+    
+    async def send_audio(self, session_id: UUID, audio_data: bytes) -> bool:
+        """Send audio data to Deepgram for transcription."""
+        
+        if session_id not in self.connections:
+            logger.error(f"No Deepgram connection found for session {session_id}")
+            return False
+        
+        try:
+            connection = self.connections[session_id]
+            connection.send(audio_data)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to send audio to Deepgram for session {session_id}: {e}")
+            return False
+    
+    async def stop_transcription(self, session_id: UUID):
+        """Stop transcription for a session."""
+        
+        if session_id in self.connections:
+            try:
+                connection = self.connections[session_id]
+                connection.finish()  # Not async
+                del self.connections[session_id]
+                logger.info(f"Stopped Deepgram transcription for session {session_id}")
+                
+            except Exception as e:
+                logger.error(f"Error stopping Deepgram transcription for session {session_id}: {e}")
+    
+    async def transcribe_file(self, audio_file_path: str) -> Dict[str, Any]:
+        """Transcribe an audio file using Deepgram (for file uploads)."""
+        
+        if not self.is_available():
+            return {"error": "Deepgram service not available"}
+        
+        try:
             with open(audio_file_path, "rb") as audio_file:
                 buffer_data = audio_file.read()
             
-            payload: FileSource = {
-                "buffer": buffer_data,
+            payload = {"buffer": buffer_data}
+            
+            options = {
+                "model": self.settings.deepgram_model,
+                "language": self.settings.deepgram_language,
+                "punctuate": True,
+                "smart_format": True,
+                "paragraphs": True,
+                "utterances": True,
+                "diarize": True
             }
             
-            # Configure options
-            options = PrerecordedOptions(
-                model=self.settings.deepgram_model,
-                smart_format=True,
-                punctuate=True,
-                paragraphs=True,
-                utterances=True,
-                diarize=True,  # Speaker diarization
-                language=self.settings.deepgram_language,
-                detect_language=False,
-            )
-            
-            # Make the API request
-            response: PrerecordedResponse = self.client.listen.prerecorded.v("1").transcribe_file(
-                payload, options
-            )
-            
-            # Parse response
-            result = response.to_dict()
+            response = self.client.listen.prerecorded.v("1").transcribe_file(payload, options)
             
             # Extract transcript
-            transcript = ""
-            confidence = 0.0
-            duration = 0.0
-            segments = []
-            
-            if "results" in result and "channels" in result["results"]:
-                channel = result["results"]["channels"][0]
-                
-                if "alternatives" in channel and len(channel["alternatives"]) > 0:
-                    alternative = channel["alternatives"][0]
-                    transcript = alternative.get("transcript", "")
-                    confidence = alternative.get("confidence", 0.0)
+            if response.results and response.results.channels:
+                channel = response.results.channels[0]
+                if channel.alternatives:
+                    transcript = channel.alternatives[0].transcript
+                    confidence = channel.alternatives[0].confidence
                     
-                    # Extract segments/words for timing
-                    words = alternative.get("words", [])
-                    if words:
-                        for word in words:
-                            segments.append({
-                                "start": word.get("start", 0.0),
-                                "end": word.get("end", 0.0),
-                                "text": word.get("word", ""),
-                                "confidence": word.get("confidence", 0.0)
-                            })
-                        
-                        # Calculate total duration
-                        if segments:
-                            duration = segments[-1]["end"]
+                    # Calculate metrics
+                    word_count = len(transcript.split()) if transcript else 0
+                    has_speech = bool(transcript.strip())
+                    
+                    # Get timing information
+                    start_time = 0.0
+                    end_time = 0.0
+                    if response.results.utterances:
+                        start_time = response.results.utterances[0].start
+                        end_time = response.results.utterances[-1].end
+                    
+                    return {
+                        "text": transcript,
+                        "confidence": confidence,
+                        "has_speech": has_speech,
+                        "word_count": word_count,
+                        "duration": end_time - start_time,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "language": self.settings.deepgram_language
+                    }
             
-            # Check if speech was detected
-            has_speech = len(transcript.strip()) > 0
-            word_count = len(transcript.split()) if transcript else 0
-            
-            response_data = {
-                "text": transcript,
-                "has_speech": has_speech,
-                "confidence": confidence,
-                "word_count": word_count,
-                "duration": duration,
-                "start_time": segments[0]["start"] if segments else 0.0,
-                "end_time": segments[-1]["end"] if segments else duration,
-                "language": self.settings.deepgram_language,
-                "segments": segments,
-                "provider": "deepgram"
-            }
-            
-            logger.debug(f"Transcription completed: {word_count} words, confidence: {confidence:.2f}")
-            return response_data
-            
-        except Exception as e:
-            logger.error(f"Transcription failed for {audio_file_path}: {e}")
             return {
                 "text": "",
-                "has_speech": False,
                 "confidence": 0.0,
+                "has_speech": False,
                 "word_count": 0,
                 "duration": 0.0,
                 "start_time": 0.0,
                 "end_time": 0.0,
-                "language": self.settings.deepgram_language,
-                "segments": [],
-                "provider": "deepgram",
-                "error": str(e)
+                "language": self.settings.deepgram_language
             }
-    
-    async def transcribe_bytes(self, audio_data: bytes, filename: str = "audio.wav") -> Dict[str, Any]:
-        """Transcribe audio from bytes."""
-        if not self.client:
-            raise Exception("Deepgram client not available")
-        
-        # Save bytes to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            tmp_file.write(audio_data)
-            tmp_file_path = tmp_file.name
-        
-        try:
-            # Transcribe the temporary file
-            result = await self.transcribe_file(tmp_file_path)
-            return result
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(tmp_file_path)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp file {tmp_file_path}: {e}")
-    
-    def get_model_info(self) -> Dict[str, Any]:
-        """Get information about available models."""
-        return {
-            "current_model": self.settings.deepgram_model,
-            "provider": "deepgram",
-            "service_available": self.is_available(),
-            "available_models": [
-                {
-                    "name": "nova-2",
-                    "description": "Latest and most accurate model",
-                    "language_support": "30+ languages",
-                    "features": ["punctuation", "diarization", "smart_format"]
-                },
-                {
-                    "name": "nova",
-                    "description": "Previous generation model",
-                    "language_support": "30+ languages",
-                    "features": ["punctuation", "diarization"]
-                },
-                {
-                    "name": "enhanced",
-                    "description": "Optimized for general use",
-                    "language_support": "30+ languages",
-                    "features": ["punctuation"]
-                },
-                {
-                    "name": "base",
-                    "description": "Fast and cost-effective",
-                    "language_support": "30+ languages",
-                    "features": ["basic_transcription"]
-                }
-            ],
-            "supported_formats": [
-                "wav", "mp3", "mp4", "m4a", "flac", "ogg", "webm", "amr"
-            ]
-        }
-
-
-class DeepgramRealtimeClient:
-    """Deepgram real-time streaming client for WebSocket audio."""
-    
-    def __init__(self, session_id: UUID, on_transcript: Callable[[Dict[str, Any]], None]):
-        self.session_id = session_id
-        self.on_transcript = on_transcript
-        self.settings = get_settings()
-        self.ws: Optional[websocket.WebSocketApp] = None
-        self.is_connected = False
-        self.connection_params = {
-            "model": self.settings.deepgram_model,
-            "language": self.settings.deepgram_language,
-            "smart_format": "true",
-            "punctuate": "true",
-            "interim_results": "true",
-            "endpointing": "300",  # 300ms of silence to finalize
-            "sample_rate": str(self.settings.audio_sample_rate),
-            "channels": "1",
-            "encoding": "linear16"
-        }
-        
-        # Build WebSocket URL
-        params = "&".join([f"{k}={v}" for k, v in self.connection_params.items()])
-        self.ws_url = f"wss://api.deepgram.com/v1/listen?{params}"
-        
-        logger.info(f"Initialized Deepgram realtime client for session {session_id}")
-    
-    def connect(self):
-        """Connect to Deepgram WebSocket."""
-        try:
-            self.ws = websocket.WebSocketApp(
-                self.ws_url,
-                header={"Authorization": f"Token {self.settings.deepgram_api_key}"},
-                on_open=self._on_open,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
-            )
-            
-            # Run WebSocket in a separate thread
-            import threading
-            self.ws_thread = threading.Thread(target=self.ws.run_forever)
-            self.ws_thread.daemon = True
-            self.ws_thread.start()
-            
-            # Wait for connection
-            timeout = 5.0
-            start_time = time.time()
-            while not self.is_connected and (time.time() - start_time) < timeout:
-                time.sleep(0.1)
-            
-            if not self.is_connected:
-                raise Exception("Failed to connect to Deepgram within timeout")
-            
-            logger.info(f"Connected to Deepgram WebSocket for session {self.session_id}")
             
         except Exception as e:
-            logger.error(f"Failed to connect to Deepgram WebSocket: {e}")
-            raise
+            logger.error(f"Deepgram file transcription failed: {e}")
+            return {"error": str(e)}
     
-    def send_audio(self, audio_data: bytes):
-        """Send audio data to Deepgram."""
-        if self.ws and self.is_connected:
-            try:
-                self.ws.send(audio_data, websocket.ABNF.OPCODE_BINARY)
-            except Exception as e:
-                logger.error(f"Failed to send audio data: {e}")
-        else:
-            logger.warning("WebSocket not connected, cannot send audio")
+    def get_connection_count(self) -> int:
+        """Get number of active connections."""
+        return len(self.connections)
     
-    def close(self):
-        """Close the WebSocket connection."""
-        if self.ws:
-            try:
-                # Send close frame
-                close_message = {"type": "CloseStream"}
-                self.ws.send(json.dumps(close_message))
-                time.sleep(0.1)  # Give time for message to send
-                
-                self.ws.close()
-                
-                # Wait for thread to finish
-                if hasattr(self, 'ws_thread') and self.ws_thread.is_alive():
-                    self.ws_thread.join(timeout=2.0)
-                    
-            except Exception as e:
-                logger.error(f"Error closing Deepgram WebSocket: {e}")
-        
-        self.is_connected = False
-        logger.info(f"Closed Deepgram WebSocket for session {self.session_id}")
-    
-    def _on_open(self, ws):
-        """Called when WebSocket connection opens."""
-        self.is_connected = True
-        logger.debug(f"Deepgram WebSocket opened for session {self.session_id}")
-    
-    def _on_message(self, ws, message):
-        """Called when receiving a message from Deepgram."""
-        try:
-            data = json.loads(message)
-            
-            # Handle different message types
-            if data.get("type") == "Results":
-                channel = data.get("channel", {})
-                alternatives = channel.get("alternatives", [])
-                
-                if alternatives:
-                    transcript_data = alternatives[0]
-                    transcript_text = transcript_data.get("transcript", "")
-                    
-                    if transcript_text.strip():  # Only process non-empty transcripts
-                        confidence = transcript_data.get("confidence", 0.0)
-                        is_final = channel.get("is_final", False)
-                        
-                        # Calculate duration and word count
-                        words = transcript_data.get("words", [])
-                        duration = 0.0
-                        if words:
-                            duration = words[-1].get("end", 0.0) - words[0].get("start", 0.0)
-                        
-                        result = {
-                            "text": transcript_text,
-                            "confidence": confidence,
-                            "is_final": is_final,
-                            "duration": duration,
-                            "word_count": len(transcript_text.split()),
-                            "words": words,
-                            "provider": "deepgram"
-                        }
-                        
-                        # Call the transcript callback
-                        self.on_transcript(result)
-                        
-                        logger.debug(f"Transcript: {transcript_text} (final: {is_final}, confidence: {confidence:.2f})")
-            
-            elif data.get("type") == "Metadata":
-                # Handle metadata messages
-                logger.debug(f"Received metadata: {data}")
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"Error decoding Deepgram message: {e}")
-        except Exception as e:
-            logger.error(f"Error handling Deepgram message: {e}")
-    
-    def _on_error(self, ws, error):
-        """Called when WebSocket error occurs."""
-        logger.error(f"Deepgram WebSocket error for session {self.session_id}: {error}")
-        self.is_connected = False
-    
-    def _on_close(self, ws, close_status_code, close_msg):
-        """Called when WebSocket connection closes."""
-        self.is_connected = False
-        logger.info(f"Deepgram WebSocket closed for session {self.session_id}: {close_status_code} - {close_msg}")
+    async def cleanup_all_connections(self):
+        """Cleanup all active connections."""
+        session_ids = list(self.connections.keys())
+        for session_id in session_ids:
+            await self.stop_transcription(session_id)
 
 
 # Global service instance
@@ -379,14 +257,3 @@ async def transcribe_audio_file(audio_file_path: str) -> Dict[str, Any]:
     """Transcribe audio file using Deepgram service."""
     deepgram_service = get_deepgram_service()
     return await deepgram_service.transcribe_file(audio_file_path)
-
-
-async def transcribe_audio_bytes(audio_data: bytes, filename: str = "audio.wav") -> Dict[str, Any]:
-    """Transcribe audio bytes using Deepgram service."""
-    deepgram_service = get_deepgram_service()
-    return await deepgram_service.transcribe_bytes(audio_data, filename)
-
-
-def is_deepgram_available() -> bool:
-    """Check if Deepgram service is available."""
-    return get_deepgram_service().is_available()

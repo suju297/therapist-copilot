@@ -7,8 +7,6 @@ name = "pypi"
 fastapi = "*"
 uvicorn = {extras = ["standard"], version = "*"}
 python-multipart = "*"
-websockets = "*"
-python-dotenv = "*"
 pydantic = "*"
 langchain = "*"
 langchain-google-genai = "*"
@@ -21,6 +19,8 @@ numpy = "*"
 soundfile = "*"
 aiofiles = "*"
 pydantic-settings = "*"
+python-dotenv = "*"
+websockets = "<13,>=11"
 
 [dev-packages]
 pytest = "*"

@@ -4,8 +4,22 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
-from pydantic import Field, validator
+from dotenv import load_dotenv
+
+# Find .env file in parent directory
+backend_dir = Path(__file__).parent
+parent_dir = backend_dir.parent
+env_path = parent_dir / ".env"
+
+# Force load .env file
+load_dotenv(env_path)
+
+# Debug logging
+print(f"Loading .env from: {env_path}")
+print(f"File exists: {env_path.exists()}")
+print(f"ASSEMBLYAI_API_KEY from env: {os.getenv('ASSEMBLYAI_API_KEY', 'NOT FOUND')}")
 
 
 class Settings(BaseSettings):
@@ -23,13 +37,22 @@ class Settings(BaseSettings):
     llm_model_risk: str = Field(default="gemini-2.0-flash-exp", env="LLM_MODEL_RISK")
     gemini_api_key: str = Field(default="", env="GEMINI_API_KEY")
     
-    # Speech-to-Text (Deepgram)
-    stt_provider: str = Field(default="deepgram", env="STT_PROVIDER")
+    # Speech-to-Text Configuration
+    stt_provider: str = Field(default="assemblyai", env="STT_PROVIDER")  # "assemblyai" or "whisper"
+    
+    # AssemblyAI Configuration
+    assemblyai_api_key: str = Field(default="", env="ASSEMBLYAI_API_KEY")
+    assemblyai_sample_rate: int = Field(default=16000, env="ASSEMBLYAI_SAMPLE_RATE")
+    assemblyai_format_turns: bool = Field(default=True, env="ASSEMBLYAI_FORMAT_TURNS")
+    
+    # Deepgram Configuration (fallback)
     deepgram_api_key: str = Field(default="", env="DEEPGRAM_API_KEY")
     deepgram_model: str = Field(default="nova-2", env="DEEPGRAM_MODEL")
-    deepgram_language: str = Field(default="en", env="DEEPGRAM_LANGUAGE")
+    deepgram_language: str = Field(default="en-US", env="DEEPGRAM_LANGUAGE")
+    deepgram_encoding: str = Field(default="linear16", env="DEEPGRAM_ENCODING")
+    deepgram_sample_rate: int = Field(default=16000, env="DEEPGRAM_SAMPLE_RATE")
     
-    # Legacy Whisper settings (for backward compatibility)
+    # Speech-to-Text (Whisper - fallback)
     whisper_model_size: str = Field(default="base", env="WHISPER_MODEL_SIZE")
     
     # Audio/WebSocket
@@ -44,34 +67,8 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="replace-me", env="SECRET_KEY")
     
     # File & Temporary Storage
-    audio_temp_dir: str = Field(default="C:\\temp\\therapist_copilot", env="AUDIO_TEMP_DIR")
+    audio_temp_dir: str = Field(default="/tmp/therapist_copilot", env="AUDIO_TEMP_DIR")
     session_timeout_hours: int = Field(default=24, env="SESSION_TIMEOUT_HOURS")
-    
-    # Validators to clean up values with inline comments
-    @validator('debug', pre=True)
-    def parse_debug(cls, v):
-        if isinstance(v, str):
-            v = v.split('#')[0].strip().lower()
-            return v in ('true', '1', 'yes', 'on')
-        return v
-    
-    @validator('audio_sample_rate', 'ws_chunk_ms', 'port', 'session_timeout_hours', pre=True)
-    def parse_int(cls, v):
-        if isinstance(v, str):
-            v = v.split('#')[0].strip()
-        return int(v)
-    
-    @validator('risk_threshold', pre=True)
-    def parse_float(cls, v):
-        if isinstance(v, str):
-            v = v.split('#')[0].strip()
-        return float(v)
-    
-    @validator('*', pre=True)
-    def strip_comments(cls, v):
-        if isinstance(v, str) and '#' in v:
-            v = v.split('#')[0].strip()
-        return v
     
     @property
     def ws_chunk_samples(self) -> int:
@@ -79,12 +76,17 @@ class Settings(BaseSettings):
         return int(self.audio_sample_rate * self.ws_chunk_ms / 1000)
     
     class Config:
-        env_file = ".env"
+        env_file = str(env_path)  # Use the absolute path
         env_file_encoding = "utf-8"
+        # Also look for environment variables that are already set
+        case_sensitive = False
 
 
 # Global settings instance
 settings = Settings()
+
+# Debug print
+print(f"Settings loaded - AssemblyAI API Key: {settings.assemblyai_api_key[:10]}..." if settings.assemblyai_api_key else "No AssemblyAI key!")
 
 
 def get_settings() -> Settings:

@@ -1,35 +1,50 @@
-"""Enhanced WebSocket route for real-time audio streaming with Deepgram integration."""
+"""WebSocket route for real-time audio streaming with multiple STT providers."""
 
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional
+import os
+from typing import Dict, Any
 from uuid import UUID, uuid4
 from datetime import datetime
+from collections import defaultdict
+from dotenv import load_dotenv
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from config import get_settings
 from services.audio_buffer import get_audio_buffer, remove_audio_buffer
-from services.stt_adapter import transcribe_audio_file, get_stt_service
 from services.risk_classifier import assess_risk_level
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-settings = get_settings()
 
 
 class ConnectionManager:
-    """Enhanced WebSocket connection manager with Deepgram real-time support."""
+    """Manages WebSocket connections for audio streaming."""
     
     def __init__(self):
         self.active_connections: Dict[UUID, WebSocket] = {}
         self.session_states: Dict[UUID, Dict[str, Any]] = {}
-        self.session_transcripts: Dict[UUID, list] = {}
-        self.deepgram_clients: Dict[UUID, Any] = {}  # Store Deepgram real-time clients
+        self.session_transcripts: Dict[UUID, list] = {}  # In-memory transcript storage
+        self._ws_lock: Dict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)  # Serialize WebSocket writes
+        self.stt_service = None
+        self._initialize_stt_service()
+    
+    def _initialize_stt_service(self):
+        """Initialize STT service based on provider."""
+        try:
+            # Always use AssemblyAI
+            from services.assemblyai_service import get_assemblyai_service
+            self.stt_service = get_assemblyai_service()
+            logger.info(f"Initialized AssemblyAI STT service for WebSocket manager")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize AssemblyAI service: {e}")
+            self.stt_service = None
     
     async def connect(self, websocket: WebSocket, session_id: UUID):
-        """Accept WebSocket connection and initialize session with real-time STT."""
+        """Accept WebSocket connection and initialize session."""
         await websocket.accept()
         self.active_connections[session_id] = websocket
         self.session_states[session_id] = {
@@ -39,161 +54,11 @@ class ConnectionManager:
             "transcripts_generated": 0,
             "is_locked": False,
             "risk_level": "low",
-            "highest_risk_score": 0.0,
-            "stt_provider": get_stt_service().get_active_provider(),
-            "realtime_enabled": False
+            "highest_risk_score": 0.0
         }
         self.session_transcripts[session_id] = []
         
-        # Initialize real-time STT if Deepgram is available
-        await self._initialize_realtime_stt(session_id)
-        
         logger.info(f"WebSocket connected for session {session_id}")
-    
-    async def _initialize_realtime_stt(self, session_id: UUID):
-        """Initialize real-time STT client if available."""
-        try:
-            stt_service = get_stt_service()
-            
-            if stt_service.get_active_provider() == "deepgram":
-                from services.deepgram_service import DeepgramRealtimeClient
-                
-                # Create transcript handler
-                def on_transcript(transcript_data: Dict[str, Any]):
-                    # Schedule the transcript processing
-                    asyncio.create_task(self._handle_realtime_transcript(session_id, transcript_data))
-                
-                # Create and connect Deepgram client
-                deepgram_client = DeepgramRealtimeClient(session_id, on_transcript)
-                deepgram_client.connect()
-                
-                self.deepgram_clients[session_id] = deepgram_client
-                self.session_states[session_id]["realtime_enabled"] = True
-                
-                logger.info(f"Real-time STT initialized for session {session_id}")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize real-time STT for session {session_id}: {e}")
-            self.session_states[session_id]["realtime_enabled"] = False
-    
-    async def _handle_realtime_transcript(self, session_id: UUID, transcript_data: Dict[str, Any]):
-        """Handle real-time transcript from Deepgram."""
-        try:
-            if session_id not in self.active_connections:
-                return
-            
-            # Store transcript if it's final
-            if transcript_data.get("is_final", False):
-                transcript_entry = {
-                    "text": transcript_data["text"],
-                    "confidence": transcript_data.get("confidence", 0.0),
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "duration": transcript_data.get("duration", 0.0),
-                    "word_count": transcript_data.get("word_count", 0),
-                    "provider": "deepgram",
-                    "realtime": True
-                }
-                
-                if session_id not in self.session_transcripts:
-                    self.session_transcripts[session_id] = []
-                self.session_transcripts[session_id].append(transcript_entry)
-                
-                # Update session state
-                if session_id in self.session_states:
-                    self.session_states[session_id]["transcripts_generated"] += 1
-                
-                # Run risk assessment in background
-                asyncio.create_task(self._check_transcript_risks(session_id, transcript_data["text"]))
-            
-            # Send transcript to client (both interim and final)
-            await self.broadcast_to_session(
-                session_id,
-                "transcription",
-                {
-                    "text": transcript_data["text"],
-                    "confidence": transcript_data.get("confidence", 0.0),
-                    "is_final": transcript_data.get("is_final", False),
-                    "word_count": transcript_data.get("word_count", 0),
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "provider": "deepgram",
-                    "realtime": True
-                }
-            )
-            
-        except Exception as e:
-            logger.error(f"Error handling real-time transcript for session {session_id}: {e}")
-    
-    async def _check_transcript_risks(self, session_id: UUID, transcript_text: str):
-        """Check transcript for risks and apply guardrails."""
-        try:
-            # Perform risk assessment
-            risk_result = await assess_risk_level(transcript_text)
-            
-            risk_score = risk_result["risk_score"]
-            risk_level = risk_result["risk_level"]
-            
-            # Update session state with risk info
-            if session_id in self.session_states:
-                current_highest = self.session_states[session_id]["highest_risk_score"]
-                if risk_score > current_highest:
-                    self.session_states[session_id]["highest_risk_score"] = risk_score
-                    self.session_states[session_id]["risk_level"] = risk_level
-            
-            # Send risk assessment to client
-            await self.broadcast_to_session(
-                session_id,
-                "risk_assessment",
-                {
-                    "risk_score": risk_score,
-                    "risk_level": risk_level,
-                    "explanation": risk_result["explanation"],
-                    "recommendations": risk_result.get("recommendations", []),
-                    "transcript_analyzed": transcript_text[:100] + "..." if len(transcript_text) > 100 else transcript_text
-                }
-            )
-            
-            # Check if immediate action is required
-            if risk_score >= settings.risk_threshold:
-                # Lock session for high risk
-                if session_id in self.session_states:
-                    self.session_states[session_id]["is_locked"] = True
-                
-                # Send crisis alert
-                await self.broadcast_to_session(
-                    session_id,
-                    "crisis_detected",
-                    {
-                        "risk_score": risk_score,
-                        "risk_level": risk_level,
-                        "explanation": risk_result["explanation"],
-                        "immediate_action_required": True,
-                        "session_locked": True,
-                        "emergency_contacts": "Contact emergency services if needed"
-                    }
-                )
-                
-                logger.warning(f"CRISIS DETECTED - Session {session_id}: Risk score {risk_score}")
-            
-            elif risk_level in ["medium", "moderate"]:
-                # Send warning for medium risk
-                await self.broadcast_to_session(
-                    session_id,
-                    "risk_warning",
-                    {
-                        "risk_score": risk_score,
-                        "risk_level": risk_level,
-                        "explanation": risk_result["explanation"],
-                        "recommendations": risk_result.get("recommendations", [])
-                    }
-                )
-        
-        except Exception as e:
-            logger.error(f"Risk assessment failed for session {session_id}: {e}")
-            await self.broadcast_to_session(
-                session_id,
-                "risk_error",
-                {"message": "Risk assessment failed"}
-            )
     
     def disconnect(self, session_id: UUID):
         """Remove WebSocket connection and cleanup."""
@@ -204,27 +69,28 @@ class ConnectionManager:
         if session_id in self.session_transcripts:
             del self.session_transcripts[session_id]
         
-        # Cleanup Deepgram client
-        if session_id in self.deepgram_clients:
-            try:
-                self.deepgram_clients[session_id].close()
-            except Exception as e:
-                logger.error(f"Error closing Deepgram client for session {session_id}: {e}")
-            del self.deepgram_clients[session_id]
-        
         # Cleanup audio buffer
         remove_audio_buffer(session_id)
+        
+        # Stop STT transcription
+        if self.stt_service:
+            asyncio.create_task(self.stt_service.stop_transcription(session_id))
+        
         logger.info(f"WebSocket disconnected for session {session_id}")
     
     async def send_message(self, session_id: UUID, message: Dict[str, Any]):
-        """Send message to specific session."""
-        if session_id in self.active_connections:
-            try:
-                websocket = self.active_connections[session_id]
-                await websocket.send_text(json.dumps(message))
-            except Exception as e:
-                logger.error(f"Failed to send message to session {session_id}: {e}")
-                self.disconnect(session_id)
+        """Send message to specific session with write serialization."""
+        if session_id not in self.active_connections:
+            return
+            
+        try:
+            # Serialize all writes to prevent WebSocket race conditions
+            async with self._ws_lock[session_id]:
+                await self.active_connections[session_id].send_text(json.dumps(message))
+        except Exception as e:
+            # Use logger.exception to see the actual error details
+            logger.exception(f"Failed to send message to session {session_id}: {e}")
+            self.disconnect(session_id)
     
     async def broadcast_to_session(self, session_id: UUID, event_type: str, data: Any):
         """Broadcast event to session."""
@@ -235,15 +101,6 @@ class ConnectionManager:
             "timestamp": datetime.utcnow().isoformat()
         }
         await self.send_message(session_id, message)
-    
-    async def send_audio_to_realtime_stt(self, session_id: UUID, audio_data: bytes):
-        """Send audio data to real-time STT service."""
-        if session_id in self.deepgram_clients:
-            try:
-                deepgram_client = self.deepgram_clients[session_id]
-                deepgram_client.send_audio(audio_data)
-            except Exception as e:
-                logger.error(f"Failed to send audio to Deepgram for session {session_id}: {e}")
     
     def get_session_summary(self, session_id: UUID) -> Dict[str, Any]:
         """Get session summary for risk assessment."""
@@ -257,8 +114,7 @@ class ConnectionManager:
             "session_id": str(session_id),
             "transcript_count": len(transcripts),
             "full_transcript": full_text,
-            "session_state": self.session_states.get(session_id, {}),
-            "realtime_enabled": self.session_states.get(session_id, {}).get("realtime_enabled", False)
+            "session_state": self.session_states.get(session_id, {})
         }
 
 
@@ -268,20 +124,113 @@ manager = ConnectionManager()
 
 @router.websocket("/ws/audio/{session_id}")
 async def websocket_audio_stream(websocket: WebSocket, session_id: UUID):
-    """Enhanced WebSocket endpoint with real-time STT and risk assessment."""
+    """WebSocket endpoint for real-time audio streaming with STT transcription."""
+    
+    # Get fresh settings for this connection
+    settings = get_settings()
     
     try:
         # Connect WebSocket
         await manager.connect(websocket, session_id)
         
-        # Initialize audio buffer (still needed for fallback processing)
+        # Initialize audio buffer
         audio_buffer = get_audio_buffer(session_id)
         
-        # Get STT service info
-        stt_service = get_stt_service()
-        service_info = stt_service.get_service_info()
+        # Initialize STT service
+        stt_service = manager.stt_service
         
-        # Send initial connection message
+        if not stt_service or not stt_service.is_available():
+            await manager.broadcast_to_session(
+                session_id,
+                "error",
+                {"message": f"{settings.stt_provider.upper()} STT service not available. Check API key configuration."}
+            )
+            logger.error(f"STT service not available for session {session_id}")
+            return
+        
+        # Check concurrent session limits for free tier
+        MAX_CONCURRENT_ASSEMBLYAI = 1  # Free plan allows exactly one live stream
+        if stt_service.get_connection_count() >= MAX_CONCURRENT_ASSEMBLYAI:
+            await manager.broadcast_to_session(
+                session_id,
+                "error",
+                {"message": "Only one concurrent realtime session allowed on free tier. Close other tabs or wait 15 seconds."}
+            )
+            logger.warning(f"Rejected session {session_id} - too many concurrent AssemblyAI connections")
+            return
+        
+        # Set up STT callbacks
+        async def on_transcript_message(transcript_data: Dict[str, Any]):
+            """Handle transcript messages from STT service."""
+            try:
+                if transcript_data.get("text"):
+                    # Store transcript
+                    transcript_entry = {
+                        "text": transcript_data["text"],
+                        "confidence": transcript_data.get("confidence", 0.0),
+                        "is_final": transcript_data.get("is_final", False),
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "start": transcript_data.get("start", 0.0),
+                        "duration": transcript_data.get("duration", 0.0)
+                    }
+                    
+                    # Only store final transcripts
+                    if transcript_data.get("is_final", False):
+                        if session_id not in manager.session_transcripts:
+                            manager.session_transcripts[session_id] = []
+                        manager.session_transcripts[session_id].append(transcript_entry)
+                        
+                        # Update session state
+                        if session_id in manager.session_states:
+                            manager.session_states[session_id]["transcripts_generated"] += 1
+                        
+                        # Run risk assessment for final transcripts
+                        asyncio.create_task(check_transcript_risks(session_id, transcript_data["text"]))
+                    
+                    # Send transcription to client
+                    await manager.broadcast_to_session(
+                        session_id,
+                        "transcription",
+                        {
+                            "text": transcript_data["text"],
+                            "confidence": transcript_data.get("confidence", 0.0),
+                            "is_final": transcript_data.get("is_final", False),
+                            "timestamp": transcript_entry["timestamp"]
+                        }
+                    )
+                    
+                    logger.debug(f"Sent transcription to session {session_id}: '{transcript_data['text'][:50]}...' (final: {transcript_data.get('is_final', False)})")
+                    
+            except Exception as e:
+                logger.error(f"Error processing transcript for session {session_id}: {e}")
+        
+        def on_stt_error(error_message: str):
+            """Handle STT errors."""
+            logger.error(f"STT error for session {session_id}: {error_message}")
+            asyncio.create_task(manager.broadcast_to_session(
+                session_id,
+                "transcription_error",
+                {"message": f"Transcription error: {error_message}"}
+            ))
+        
+        # Start real-time transcription
+        transcription_started = await stt_service.start_real_time_transcription(
+            session_id=session_id,
+            on_message_callback=on_transcript_message,
+            on_error_callback=on_stt_error
+        )
+        
+        if not transcription_started:
+            await manager.broadcast_to_session(
+                session_id,
+                "error",
+                {"message": "Failed to start real-time transcription"}
+            )
+            logger.error(f"Failed to start STT transcription for session {session_id}")
+            return
+
+        # Send initial connection message ONLY after STT service confirms it's ready
+        # (AssemblyAI v3 now waits for "Begin" frame before returning True)
         await manager.broadcast_to_session(
             session_id,
             "connection_established",
@@ -290,15 +239,15 @@ async def websocket_audio_stream(websocket: WebSocket, session_id: UUID):
                 "audio_config": {
                     "sample_rate": settings.audio_sample_rate,
                     "chunk_ms": settings.ws_chunk_ms,
-                    "chunk_samples": settings.ws_chunk_samples
+                    "chunk_samples": settings.ws_chunk_samples,
+                    "encoding": "linear16"
                 },
-                "stt_config": {
-                    "provider": service_info["active_provider"],
-                    "realtime_enabled": manager.session_states[session_id]["realtime_enabled"]
-                },
-                "risk_threshold": settings.risk_threshold
+                "risk_threshold": settings.risk_threshold,
+                "stt_provider": settings.stt_provider,
+                "stt_state": "ready"  # ← ADD THIS LINE!
             }
         )
+        logger.info(f"connection_established sent to session {session_id} after STT confirmation")
         
         # Main message loop
         while True:
@@ -323,7 +272,7 @@ async def websocket_audio_stream(websocket: WebSocket, session_id: UUID):
                 if message["type"] == "websocket.receive":
                     if "bytes" in message:
                         # Audio data received
-                        await handle_audio_chunk(session_id, message["bytes"], audio_buffer)
+                        await handle_audio_chunk(session_id, message["bytes"], audio_buffer, stt_service)
                     elif "text" in message:
                         # Control message received
                         await handle_control_message(session_id, message["text"])
@@ -356,18 +305,18 @@ async def websocket_audio_stream(websocket: WebSocket, session_id: UUID):
         manager.disconnect(session_id)
 
 
-async def handle_audio_chunk(session_id: UUID, audio_data: bytes, audio_buffer):
-    """Handle incoming audio chunk with both real-time and batch processing."""
+async def handle_audio_chunk(session_id: UUID, audio_data: bytes, audio_buffer, stt_service):
+    """Handle incoming audio chunk."""
     try:
-        # Add to audio buffer (for fallback processing)
+        # Add to audio buffer
         buffer_stats = audio_buffer.add_chunk(audio_data)
         
         # Update session state
         if session_id in manager.session_states:
             manager.session_states[session_id]["chunks_received"] += 1
         
-        # Send to real-time STT if available
-        await manager.send_audio_to_realtime_stt(session_id, audio_data)
+        # Send audio data to STT service
+        await stt_service.send_audio(session_id, audio_data)
         
         # Send buffer status update
         await manager.broadcast_to_session(
@@ -376,17 +325,10 @@ async def handle_audio_chunk(session_id: UUID, audio_data: bytes, audio_buffer):
             {
                 "chunk_number": buffer_stats["chunk_number"],
                 "duration_seconds": buffer_stats["duration_seconds"],
-                "total_samples": buffer_stats["total_samples"],
-                "realtime_processing": manager.session_states[session_id]["realtime_enabled"]
+                "total_samples": buffer_stats["total_samples"]
             }
         )
         
-        # Fallback batch processing (for non-real-time providers or backup)
-        if not manager.session_states[session_id]["realtime_enabled"]:
-            # Process transcription for recent chunks (every 3rd chunk to avoid overload)
-            if buffer_stats["chunk_number"] % 3 == 0:
-                await process_transcription_batch(session_id, audio_buffer)
-    
     except Exception as e:
         logger.error(f"Failed to handle audio chunk for session {session_id}: {e}")
         await manager.broadcast_to_session(
@@ -396,74 +338,79 @@ async def handle_audio_chunk(session_id: UUID, audio_data: bytes, audio_buffer):
         )
 
 
-async def process_transcription_batch(session_id: UUID, audio_buffer):
-    """Process transcription and risk assessment for recent audio chunks (fallback method)."""
+async def check_transcript_risks(session_id: UUID, transcript_text: str):
+    """Check transcript for risks and apply guardrails."""
     try:
-        # Get combined audio file for recent chunks
-        audio_file = audio_buffer.get_combined_audio_file(last_n_chunks=3)
+        # Get fresh settings for risk threshold
+        settings = get_settings()
         
-        if not audio_file:
-            return
+        # Perform risk assessment
+        risk_result = await assess_risk_level(transcript_text)
         
-        # Transcribe audio using batch API
-        transcription_result = await transcribe_audio_file(audio_file)
+        risk_score = risk_result["risk_score"]
+        risk_level = risk_result["risk_level"]
         
-        if not transcription_result.get("has_speech", False):
-            # No speech detected, skip
-            return
-        
-        transcript_text = transcription_result["text"]
-        
-        # Store transcript in memory
-        transcript_data = {
-            "text": transcript_text,
-            "confidence": transcription_result.get("confidence"),
-            "timestamp": datetime.utcnow().isoformat(),
-            "chunk_index": audio_buffer.chunk_counter,
-            "duration": transcription_result.get("duration"),
-            "provider": transcription_result.get("provider", "unknown"),
-            "realtime": False
-        }
-        
-        if session_id not in manager.session_transcripts:
-            manager.session_transcripts[session_id] = []
-        manager.session_transcripts[session_id].append(transcript_data)
-        
-        # Update session state
+        # Update session state with risk info
         if session_id in manager.session_states:
-            manager.session_states[session_id]["transcripts_generated"] += 1
+            current_highest = manager.session_states[session_id]["highest_risk_score"]
+            if risk_score > current_highest:
+                manager.session_states[session_id]["highest_risk_score"] = risk_score
+                manager.session_states[session_id]["risk_level"] = risk_level
         
-        # Send transcription to client
+        # Send risk assessment to client
         await manager.broadcast_to_session(
             session_id,
-            "transcription",
+            "risk_assessment",
             {
-                "text": transcript_text,
-                "confidence": transcription_result.get("confidence"),
-                "chunk_index": audio_buffer.chunk_counter,
-                "word_count": transcription_result.get("word_count", 0),
-                "timestamp": transcript_data["timestamp"],
-                "provider": transcription_result.get("provider", "unknown"),
-                "realtime": False
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "explanation": risk_result["explanation"],
+                "recommendations": risk_result.get("recommendations", []),
+                "transcript_analyzed": transcript_text[:100] + "..." if len(transcript_text) > 100 else transcript_text
             }
         )
         
-        # Run risk assessment in background
-        asyncio.create_task(manager._check_transcript_risks(session_id, transcript_text))
+        # Check if immediate action is required
+        if risk_score >= settings.risk_threshold:
+            # Lock session for high risk
+            if session_id in manager.session_states:
+                manager.session_states[session_id]["is_locked"] = True
+            
+            # Send crisis alert
+            await manager.broadcast_to_session(
+                session_id,
+                "crisis_detected",
+                {
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                    "explanation": risk_result["explanation"],
+                    "immediate_action_required": True,
+                    "session_locked": True,
+                    "emergency_contacts": "Contact emergency services if needed"
+                }
+            )
+            
+            logger.warning(f"CRISIS DETECTED - Session {session_id}: Risk score {risk_score}")
         
-        # Clean up temporary audio file
-        import os
-        try:
-            os.remove(audio_file)
-        except:
-            pass
+        elif risk_level in ["medium", "moderate"]:
+            # Send warning for medium risk
+            await manager.broadcast_to_session(
+                session_id,
+                "risk_warning",
+                {
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                    "explanation": risk_result["explanation"],
+                    "recommendations": risk_result.get("recommendations", [])
+                }
+            )
     
     except Exception as e:
-        logger.error(f"Transcription batch processing failed for session {session_id}: {e}")
+        logger.error(f"Risk assessment failed for session {session_id}: {e}")
         await manager.broadcast_to_session(
             session_id,
-            "transcription_error",
-            {"message": "Transcription processing failed"}
+            "risk_error",
+            {"message": "Risk assessment failed"}
         )
 
 
@@ -499,14 +446,28 @@ async def handle_control_message(session_id: UUID, message_text: str):
                 {"message": "Session reset successfully"}
             )
         
-        elif command == "get_stt_status":
-            stt_service = get_stt_service()
-            service_info = stt_service.get_service_info()
-            
+        elif command == "ping":
+            # Handle ping/pong for connection testing
             await manager.broadcast_to_session(
                 session_id,
-                "stt_status",
-                service_info
+                "pong",
+                {"timestamp": control_data.get("timestamp", datetime.utcnow().isoformat())}
+            )
+        
+        elif command == "get_status":
+            # Send current session status
+            session_state = manager.session_states.get(session_id, {})
+            await manager.broadcast_to_session(
+                session_id,
+                "status_update",
+                {
+                    "session_state": {
+                        **session_state,
+                        "connected_at": session_state.get("connected_at", datetime.utcnow()).isoformat(),
+                        "last_activity": session_state.get("last_activity", datetime.utcnow()).isoformat()
+                    },
+                    "transcript_count": len(manager.session_transcripts.get(session_id, []))
+                }
             )
         
     except json.JSONDecodeError:
@@ -522,17 +483,80 @@ async def handle_control_message(session_id: UUID, message_text: str):
 @router.get("/ws/sessions")
 async def get_active_sessions():
     """Get information about active WebSocket sessions."""
+    settings = get_settings()  # Get fresh settings
+    
+    stt_connections = 0
+    if manager.stt_service:
+        stt_connections = manager.stt_service.get_connection_count()
+    
     return {
         "active_sessions": len(manager.active_connections),
+        "stt_connections": stt_connections,
+        "stt_provider": settings.stt_provider,
         "sessions": {
             str(session_id): {
                 **state,
                 "connected_at": state["connected_at"].isoformat(),
                 "last_activity": state["last_activity"].isoformat(),
-                "transcript_count": len(manager.session_transcripts.get(session_id, [])),
-                "realtime_enabled": state.get("realtime_enabled", False),
-                "stt_provider": state.get("stt_provider", "unknown")
+                "transcript_count": len(manager.session_transcripts.get(session_id, []))
             }
             for session_id, state in manager.session_states.items()
         }
     }
+
+
+@router.get("/ws/stats")
+async def get_websocket_stats():
+    """Get WebSocket connection statistics."""
+    settings = get_settings()
+    
+    stt_connections = 0
+    if manager.stt_service:
+        stt_connections = manager.stt_service.get_connection_count()
+    
+    return {
+        "active_connections": len(manager.active_connections),
+        "active_sessions": len(manager.session_states),
+        "stt_connections": stt_connections,
+        "stt_provider": settings.stt_provider,
+        "total_transcripts": sum(len(transcripts) for transcripts in manager.session_transcripts.values()),
+        "sessions": {
+            str(session_id): {
+                "chunks_received": state["chunks_received"],
+                "transcripts_generated": state["transcripts_generated"],
+                "risk_level": state["risk_level"],
+                "is_locked": state["is_locked"],
+                "connected_duration_seconds": (datetime.utcnow() - state["connected_at"]).total_seconds()
+            }
+            for session_id, state in manager.session_states.items()
+        }
+    }
+
+
+@router.post("/ws/test-message/{session_id}")
+async def test_message_to_session(session_id: UUID, message: str = "Test message"):
+    """Test endpoint to send a message to a specific session (for debugging)."""
+    if session_id in manager.active_connections:
+        await manager.broadcast_to_session(
+            session_id,
+            "test_message",
+            {"message": message, "sent_at": datetime.utcnow().isoformat()}
+        )
+        return {"success": True, "message": f"Test message sent to session {session_id}"}
+    else:
+        return {"success": False, "error": "Session not found"}, 404
+
+
+@router.post("/ws/disconnect/{session_id}")
+async def force_disconnect_session(session_id: UUID):
+    """Force disconnect a WebSocket session (admin endpoint)."""
+    if session_id in manager.active_connections:
+        await manager.broadcast_to_session(
+            session_id,
+            "force_disconnect",
+            {"reason": "Session terminated by administrator"}
+        )
+        manager.disconnect(session_id)
+        return {"message": f"Session {session_id} disconnected"}
+    else:
+        return {"error": "Session not found"}, 404

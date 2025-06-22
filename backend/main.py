@@ -1,4 +1,4 @@
-"""Enhanced FastAPI application with Deepgram integration for transcription and risk assessment."""
+"""Simplified FastAPI application for transcription and risk assessment."""
 
 import logging
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan manager with enhanced STT service initialization."""
+    """Application lifespan manager."""
     settings = get_settings()
     logger.info(f"Starting {settings.app_name}")
     
@@ -31,37 +31,57 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     os.makedirs(settings.audio_temp_dir, exist_ok=True)
     logger.info(f"Audio temp directory: {settings.audio_temp_dir}")
     
-    # Initialize STT services
+    # Initialize STT service based on provider
     try:
-        from services.stt_adapter import get_stt_service
-        stt_service = get_stt_service()
-        
-        if stt_service.is_available():
-            active_provider = stt_service.get_active_provider()
-            logger.info(f"STT service initialized successfully with provider: {active_provider}")
-            
-            # Log service capabilities
-            service_info = stt_service.get_service_info()
-            logger.info(f"Available STT services: {[svc.get('provider', 'unknown') for svc in service_info['available_services']]}")
+        if settings.stt_provider == "assemblyai":
+            from services.assemblyai_service import get_assemblyai_service
+            assemblyai_service = get_assemblyai_service()
+            if assemblyai_service.is_available():
+                logger.info("AssemblyAI service initialized successfully")
+            else:
+                logger.warning("AssemblyAI service initialization failed - check API key")
+        elif settings.stt_provider == "deepgram":
+            from services.deepgram_service import get_deepgram_service
+            deepgram_service = get_deepgram_service()
+            if deepgram_service.is_available():
+                logger.info("Deepgram service initialized successfully")
+            else:
+                logger.warning("Deepgram service initialization failed - check API key")
         else:
-            logger.warning("No STT service available - please configure Deepgram API key or Whisper model")
-            
+            from services.stt_adapter import get_stt_adapter
+            stt_adapter = get_stt_adapter()
+            if stt_adapter.is_available():
+                logger.info(f"STT service ({settings.stt_provider}) initialized successfully")
+            else:
+                logger.warning(f"STT service ({settings.stt_provider}) initialization failed")
     except Exception as e:
-        logger.error(f"Failed to initialize STT services: {e}")
+        logger.error(f"Failed to initialize STT service: {e}")
     
-    # Initialize risk assessment service
+    # Initialize Gemini for risk assessment
     try:
-        from services.risk_classifier import assess_risk_level
-        # Test with a simple phrase
-        test_result = await assess_risk_level("I feel okay today.")
-        if "error" not in test_result:
-            logger.info("Risk assessment service initialized successfully")
+        if settings.gemini_api_key:
+            logger.info("Gemini API key configured for risk assessment")
         else:
-            logger.warning(f"Risk assessment service error: {test_result['error']}")
+            logger.warning("Gemini API key not configured - risk assessment will fail")
     except Exception as e:
-        logger.error(f"Failed to initialize risk assessment service: {e}")
+        logger.error(f"Error checking Gemini configuration: {e}")
     
     yield
+    
+    # Cleanup on shutdown
+    try:
+        if settings.stt_provider == "assemblyai":
+            from services.assemblyai_service import get_assemblyai_service
+            assemblyai_service = get_assemblyai_service()
+            await assemblyai_service.cleanup_all_connections()
+            logger.info("Cleaned up AssemblyAI connections")
+        elif settings.stt_provider == "deepgram":
+            from services.deepgram_service import get_deepgram_service
+            deepgram_service = get_deepgram_service()
+            await deepgram_service.cleanup_all_connections()
+            logger.info("Cleaned up Deepgram connections")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
     
     logger.info("Shutting down application")
 
@@ -72,8 +92,8 @@ def create_app() -> FastAPI:
     
     app = FastAPI(
         title=settings.app_name,
-        description="AI-powered transcription and risk assessment for therapy sessions with Deepgram integration",
-        version="2.0.0",
+        description="AI-powered transcription and risk assessment for therapy sessions",
+        version="1.0.0",
         debug=settings.debug,
         lifespan=lifespan
     )
@@ -87,13 +107,44 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     
-    # Include API routes
+    # Include all necessary routes
     from routes import health, stt, ws_stream
-    from routes.risk_assessment import router as risk_router
     
+    # Create risk assessment router if it doesn't exist
+    try:
+        from routes import risk_assessment
+        app.include_router(risk_assessment.router, prefix="/api/v1/risk", tags=["Risk Assessment"])
+    except ImportError:
+        # Create a simple risk assessment route if the module doesn't exist
+        from fastapi import APIRouter
+        from pydantic import BaseModel
+        from services.risk_classifier import assess_risk_level
+        
+        risk_router = APIRouter()
+        
+        class RiskAssessmentRequest(BaseModel):
+            text: str
+        
+        @risk_router.post("/assess")
+        async def assess_risk(request: RiskAssessmentRequest):
+            """Assess risk level of the given text."""
+            try:
+                result = await assess_risk_level(request.text)
+                return result
+            except Exception as e:
+                logger.error(f"Risk assessment failed: {e}")
+                return {
+                    "risk_score": 0.5,
+                    "risk_level": "medium",
+                    "explanation": f"Risk assessment error: {str(e)}",
+                    "recommendations": ["Manual review required due to assessment error"]
+                }
+        
+        app.include_router(risk_router, prefix="/api/v1/risk", tags=["Risk Assessment"])
+    
+    # Include other routes
     app.include_router(health.router, prefix="/api/v1", tags=["Health"])
     app.include_router(stt.router, prefix="/api/v1/stt", tags=["Speech-to-Text"])
-    app.include_router(risk_router, prefix="/api/v1/risk", tags=["Risk Assessment"])
     app.include_router(ws_stream.router, prefix="/api/v1", tags=["WebSocket Audio Stream"])
     
     # Global exception handler
@@ -108,30 +159,11 @@ def create_app() -> FastAPI:
     # Root endpoint
     @app.get("/", include_in_schema=False)
     async def root():
-        settings = get_settings()
-        from services.stt_adapter import get_stt_service
-        
-        stt_service = get_stt_service()
-        active_provider = stt_service.get_active_provider()
-        
         return {
             "message": f"Welcome to {settings.app_name}",
-            "version": "2.0.0",
-            "features": [
-                "Real-time audio transcription",
-                "Multi-provider STT support (Deepgram, Whisper)",
-                "Risk assessment and crisis detection",
-                "WebSocket streaming",
-                "File upload transcription"
-            ],
-            "stt_provider": active_provider,
-            "endpoints": {
-                "health": "/api/v1/health",
-                "transcribe_file": "/api/v1/stt/transcribe",
-                "assess_risk": "/api/v1/risk/assess",
-                "websocket_stream": "/api/v1/ws/audio/{session_id}",
-                "api_docs": "/docs"
-            }
+            "version": "1.0.0",
+            "stt_provider": settings.stt_provider,
+            "status": "running"
         }
     
     return app
